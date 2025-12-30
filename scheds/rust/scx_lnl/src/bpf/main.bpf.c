@@ -46,7 +46,13 @@ const volatile bool debug;
 const volatile bool rr_sched;
 
 /* Primary domain includes all CPU */
-const volatile bool primary_all = true;
+/*
+ * True if the primary domain includes all CPUs.
+ *
+ * Stored in the BSS so it can be updated at runtime when the power profile
+ * changes (without requiring a scheduler reload).
+ */
+volatile bool primary_all;
 
 /*
  * Default task time slice.
@@ -103,7 +109,7 @@ const volatile u64 interactive_boost_ns = 20ULL * NSEC_PER_MSEC;
  * P-cores for latency-sensitive work while still allowing the primary domain
  * to include all CPUs for throughput.
  */
-const volatile bool prefer_perf_for_interactive;
+volatile bool prefer_perf_for_interactive;
 
 /*
  * Allow overflowing to non-primary CPUs more aggressively.
@@ -114,7 +120,7 @@ const volatile bool prefer_perf_for_interactive;
  *
  * This is typically enabled in performance-oriented profiles.
  */
-const volatile bool aggressive_overflow;
+volatile bool aggressive_overflow;
 
 /*
  * More aggressive CPU performance hinting in performance profile.
@@ -124,7 +130,7 @@ const volatile bool aggressive_overflow;
  * that need higher single-thread performance even if the steady-state CPU
  * utilization is not high (e.g. frame-based rendering).
  */
-const volatile bool aggressive_cpuperf;
+volatile bool aggressive_cpuperf;
 
 /*
  * Target cpuperf level used for interactive boosts (0..SCX_CPUPERF_ONE).
@@ -1812,8 +1818,11 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 * frequencies sooner. Some workloads (e.g. frame-based rendering) are
 	 * frequency-sensitive even at moderate utilization.
 	 */
-	if (aggressive_cpuperf && cpu_is_big[cpu])
-		perf_lvl = MIN(perf_lvl * 2, SCX_CPUPERF_ONE);
+	if (aggressive_cpuperf) {
+		u32 cpu_id = (u32)cpu;
+		if (cpu_id < (u32)nr_cpu_ids && cpu_is_big[cpu_id])
+			perf_lvl = MIN(perf_lvl * 2, SCX_CPUPERF_ONE);
+	}
 
 	/*
 	 * Use a moving average to evaluate the target performance level,

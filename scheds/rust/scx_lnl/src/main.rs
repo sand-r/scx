@@ -525,7 +525,6 @@ impl<'a> Scheduler<'a> {
         rodata.run_lag = opts.run_us_lag * 1000;
         rodata.throttle_ns = opts.throttle_us * 1000;
         rodata.max_avg_nvcsw = opts.max_avg_nvcsw;
-        rodata.primary_all = domain.weight() == *NR_CPU_IDS;
         rodata.interactive_nvcsw_thresh = opts.interactive_nvcsw_thresh;
         rodata.interactive_boost_ns = opts.interactive_boost_ms * 1_000_000;
         // Power-profile-driven knobs should only apply when using auto domain selection.
@@ -533,9 +532,12 @@ impl<'a> Scheduler<'a> {
         // honor that choice and avoid silently pulling work into the perf domain.
         let perf_profile = power_profile == PowerProfile::Performance;
         let auto_domain = opts.primary_domain == "auto";
-        rodata.prefer_perf_for_interactive = perf_profile && auto_domain;
-        rodata.aggressive_overflow = perf_profile && auto_domain;
-        rodata.aggressive_cpuperf = perf_profile;
+
+        let bss = skel.maps.bss_data.as_mut().unwrap();
+        bss.primary_all = domain.weight() == *NR_CPU_IDS;
+        bss.prefer_perf_for_interactive = perf_profile && auto_domain;
+        bss.aggressive_overflow = perf_profile && auto_domain;
+        bss.aggressive_cpuperf = perf_profile && auto_domain;
         rodata.interactive_boost_perf_lvl = opts.interactive_boost_lvl.min(1024);
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
@@ -831,22 +833,44 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn refresh_sched_domain(&mut self) -> bool {
-        if self.power_profile != PowerProfile::Unknown {
-            let power_profile = Self::power_profile();
-            if power_profile != self.power_profile {
-                self.power_profile = power_profile;
+    fn refresh_sched_domain(&mut self) {
+        if self.power_profile == PowerProfile::Unknown {
+            return;
+        }
 
-                if self.opts.primary_domain == "auto" {
-                    return true;
+        let power_profile = Self::power_profile();
+        if power_profile == self.power_profile {
+            return;
+        }
+        self.power_profile = power_profile;
+
+        let perf_profile = power_profile == PowerProfile::Performance;
+        let auto_domain = self.opts.primary_domain == "auto";
+
+        // Update profile-driven knobs and scheduling domains at runtime, without
+        // reloading the scheduler.
+        if let Some(bss) = self.skel.maps.bss_data.as_mut() {
+            bss.prefer_perf_for_interactive = perf_profile && auto_domain;
+            bss.aggressive_overflow = perf_profile && auto_domain;
+            bss.aggressive_cpuperf = perf_profile && auto_domain;
+        }
+
+        if auto_domain {
+            match Self::resolve_energy_domain(&self.opts.primary_domain, power_profile) {
+                Ok(domain) => {
+                    if let Err(err) = Self::init_energy_domain(&mut self.skel, &domain) {
+                        warn!("failed to refresh primary domain: error {}", err);
+                    } else if let Some(bss) = self.skel.maps.bss_data.as_mut() {
+                        bss.primary_all = domain.weight() == *NR_CPU_IDS;
+                    }
                 }
-                if let Err(err) = Self::init_cpufreq_perf(&mut self.skel, self.opts.cpufreq) {
-                    warn!("failed to refresh cpufreq performance level: error {}", err);
-                }
+                Err(err) => warn!("failed to resolve refreshed primary domain: {}", err),
             }
         }
 
-        false
+        if let Err(err) = Self::init_cpufreq_perf(&mut self.skel, self.opts.cpufreq) {
+            warn!("failed to refresh cpufreq performance level: error {}", err);
+        }
     }
 
     fn enable_sibling_cpu(
@@ -1041,10 +1065,7 @@ impl<'a> Scheduler<'a> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            if self.refresh_sched_domain() {
-                self.user_restart = true;
-                break;
-            }
+            self.refresh_sched_domain();
 
             if self.opts.cpu_busy_thresh < 0 {
                 if let Some(curr_cputime) = Self::read_cpu_times() {
