@@ -1819,8 +1819,9 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 * frequency-sensitive even at moderate utilization.
 	 */
 	if (aggressive_cpuperf) {
-		u32 cpu_id = (u32)cpu;
-		if (cpu_id < (u32)nr_cpu_ids && cpu_is_big[cpu_id])
+		const struct cpumask *perf = cast_mask(perf_cpumask);
+
+		if (perf && bpf_cpumask_test_cpu(cpu, perf))
 			perf_lvl = MIN(perf_lvl * 2, SCX_CPUPERF_ONE);
 	}
 
