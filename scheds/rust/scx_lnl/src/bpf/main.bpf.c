@@ -847,9 +847,8 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 				 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *primary;
-	const struct cpumask *perf;
+	const struct cpumask *perf = NULL;
 	s32 cpu;
-	bool using_perf = false;
 
 	if (!builtin_idle || !bpf_ksym_exists(scx_bpf_select_cpu_and))
 		return -ENOENT;
@@ -858,19 +857,20 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 	if (!primary)
 		return -EINVAL;
 
-	if (is_interactive(p, tctx)) {
-		perf = cast_mask(perf_cpumask);
-		if (perf) {
-			primary = perf;
-			using_perf = true;
-		}
-	}
-
 	if (no_wake_sync)
 		wake_flags &= ~SCX_WAKE_SYNC;
 
-	cpu = (!using_perf && primary_all) ? -ENOENT :
+	/*
+	 * Default to picking an idle CPU in the primary (typically energy)
+	 * domain. Use the perf domain only as an escape hatch.
+	 */
+	if (is_interactive(p, tctx))
+		perf = cast_mask(perf_cpumask);
+
+	cpu = primary_all ? -ENOENT :
 			scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, primary, 0);
+	if (cpu < 0 && perf)
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, perf, 0);
 	if (cpu < 0) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
 		if (cpu < 0)
@@ -879,56 +879,6 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 	*is_idle = true;
 
 	return cpu;
-}
-
-static s32 pick_idle_cpu_perf(struct task_struct *p, s32 prev_cpu,
-			      const struct cpumask *idle_smtmask,
-			      const struct cpumask *idle_cpumask,
-			      bool *is_idle)
-{
-	const struct cpumask *perf = cast_mask(perf_cpumask);
-	s32 cpu;
-
-	if (!perf)
-		return -ENOENT;
-
-	if (bpf_cpumask_test_cpu(prev_cpu, perf) &&
-	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    (!smt_enabled || bpf_cpumask_test_cpu(prev_cpu, idle_smtmask)) &&
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		*is_idle = true;
-		return prev_cpu;
-	}
-
-	if (smt_enabled) {
-		bpf_for(cpu, 0, nr_cpu_ids) {
-			if (!bpf_cpumask_test_cpu(cpu, perf))
-				continue;
-			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-				continue;
-			if (!bpf_cpumask_test_cpu(cpu, idle_smtmask))
-				continue;
-			if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
-				*is_idle = true;
-				return cpu;
-			}
-		}
-	}
-
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (!bpf_cpumask_test_cpu(cpu, perf))
-			continue;
-		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-			continue;
-		if (!bpf_cpumask_test_cpu(cpu, idle_cpumask))
-			continue;
-		if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
-			*is_idle = true;
-			return cpu;
-		}
-	}
-
-	return -ENOENT;
 }
 
 /*
@@ -990,13 +940,11 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	idle_cpumask = get_idle_cpumask_node(node);
 
 	/*
-	 * For interactive tasks, try the performance domain first.
+	 * For interactive tasks, don't try the performance domain first:
+	 * it tends to keep the perf cores awake due to periodic background
+	 * wakeups (timers, IM, mail sync, etc). The perf domain is an
+	 * escape hatch when the primary domain is saturated.
 	 */
-	if (is_interactive(p, tctx)) {
-		cpu = pick_idle_cpu_perf(p, prev_cpu, idle_smtmask, idle_cpumask, is_idle);
-		if (cpu >= 0)
-			goto out_put_cpumask;
-	}
 
 	/*
 	 * In case of a sync wakeup, attempt to run the wakee on the
@@ -1241,9 +1189,6 @@ s32 BPF_STRUCT_OPS(ext_select_cpu, struct task_struct *p,
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p, cpu), 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	}
-
-	if (cpufreq_perf_lvl == -1 && is_interactive(p, tctx))
-		scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 
 	return cpu;
 }
@@ -1694,8 +1639,18 @@ void BPF_STRUCT_OPS(ext_dispatch, s32 cpu, struct task_struct *prev)
 	 * to run, simply replenish its time slice and let it run for another
 	 * round on the same CPU.
 	 */
-	if (prev && keep_running(prev, cpu))
+	if (prev && keep_running(prev, cpu)) {
 		prev->scx.slice = task_slice(prev, cpu);
+		return;
+	}
+
+	/*
+	 * If we couldn't find anything to run, the CPU is going to go idle.
+	 * Drop the cpuperf request so we don't keep a high HWP desired value
+	 * lingering on otherwise idle CPUs.
+	 */
+	if (cpufreq_perf_lvl == -1)
+		scx_bpf_cpuperf_set(cpu, 0);
 }
 
 /*
