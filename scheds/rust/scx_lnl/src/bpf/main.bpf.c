@@ -106,6 +106,17 @@ const volatile u64 interactive_boost_ns = 20ULL * NSEC_PER_MSEC;
 const volatile bool prefer_perf_for_interactive;
 
 /*
+ * Allow overflowing to non-primary CPUs more aggressively.
+ *
+ * When enabled, tasks may be placed on CPUs outside the primary domain as soon
+ * as the primary domain has no idle CPU, instead of keeping work consolidated
+ * on the primary CPUs.
+ *
+ * This is typically enabled in performance-oriented profiles.
+ */
+const volatile bool aggressive_overflow;
+
+/*
  * Target cpuperf level used for interactive boosts (0..SCX_CPUPERF_ONE).
  *
  * This is a floor - the scheduler won't reduce the cpuperf request if the
@@ -894,7 +905,8 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 	 * Avoid waking up non-primary CPUs unless the primary domain is saturated
 	 * (or if the task can't use any primary CPU at all).
 	 */
-	allow_non_primary = primary_all ||
+	allow_non_primary = aggressive_overflow ||
+			    primary_all ||
 			    !bpf_cpumask_intersects(primary, p->cpus_ptr) ||
 			    is_cpu_busy(prev_cpu);
 
@@ -995,6 +1007,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 				p_mask && bpf_cpumask_test_cpu(prev_cpu, p_mask);
 
 	allow_non_primary = primary_all ||
+			    aggressive_overflow ||
 			    !bpf_cpumask_intersects(primary, p->cpus_ptr) ||
 			    is_cpu_busy(prev_cpu);
 
