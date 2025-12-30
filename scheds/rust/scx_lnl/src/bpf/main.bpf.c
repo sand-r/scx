@@ -789,13 +789,12 @@ static void task_update_domain(struct task_struct *p, struct task_ctx *tctx,
 	 * Determine the task's scheduling domain.
 	 * idle CPU, re-try again with the primary scheduling domain.
 	 */
-	if (primary_all) {
-		p_mask = cpumask;
-	} else {
+	bpf_cpumask_copy(mask, cpumask);
+	if (!primary_all) {
 		if (!bpf_cpumask_and(mask, cpumask, cast_mask(primary)))
 			bpf_cpumask_copy(mask, cpumask);
-		p_mask = cast_mask(mask);
 	}
+	p_mask = cast_mask(mask);
 
 	/*
 	 * Determine the L2 cache domain as the intersection of the task's
@@ -1011,7 +1010,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	/*
 	 * Get the task's primary scheduling domain.
 	 */
-	p_mask = primary_all ? p->cpus_ptr : cast_mask(tctx->cpumask);
+	p_mask = cast_mask(tctx->cpumask);
 
 	/*
 	 * Decide whether the task can continue running on the same CPU:
@@ -1164,7 +1163,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		/*
 		 * Search for any full-idle CPU usable by the task.
 		 */
-		if (allow_non_primary && p_mask != p->cpus_ptr) {
+		if (allow_non_primary && !primary_all) {
 			cpu = pick_idle_cpu_node(p->cpus_ptr, node,
 						SCX_PICK_IDLE_CORE);
 			if (cpu >= 0) {
@@ -1223,7 +1222,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	/*
 	 * Search for any idle CPU usable by the task.
 	 */
-	if (allow_non_primary && p_mask != p->cpus_ptr) {
+	if (allow_non_primary && !primary_all) {
 		cpu = pick_idle_cpu_node(p->cpus_ptr, node, 0);
 		if (cpu >= 0) {
 			*is_idle = true;
