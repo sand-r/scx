@@ -375,8 +375,15 @@ struct Opts {
     /// Enable CPU frequency control (only with schedutil governor).
     ///
     /// With this option enabled the CPU frequency will be automatically scaled based on the load.
-    #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
+    ///
+    /// If neither `--cpufreq` nor `--no-cpufreq` is specified, scx_lnl will auto-enable cpuperf
+    /// control when it detects a schedutil-based setup (e.g. `intel_pstate=passive` + `schedutil`).
+    #[clap(short = 'f', long, action = clap::ArgAction::SetTrue, conflicts_with = "no_cpufreq")]
     cpufreq: bool,
+
+    /// Force disable CPU frequency control (even if auto-detection would enable it).
+    #[clap(long, action = clap::ArgAction::SetTrue, conflicts_with = "cpufreq")]
+    no_cpufreq: bool,
 
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
@@ -422,9 +429,43 @@ struct Scheduler<'a> {
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
+    cpufreq_enabled: bool,
 }
 
 impl<'a> Scheduler<'a> {
+    fn read_sysfs_trim(path: &str) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn detect_cpufreq_enabled() -> bool {
+        let governor = Self::read_sysfs_trim("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor");
+        if governor.as_deref() != Some("schedutil") {
+            return false;
+        }
+
+        // If intel_pstate is active, don't try to drive cpuperf from sched_ext; the hardware
+        // governor owns frequency selection in that mode.
+        let intel_pstate_status = Self::read_sysfs_trim("/sys/devices/system/cpu/intel_pstate/status");
+        if intel_pstate_status.as_deref() == Some("active") {
+            return false;
+        }
+
+        true
+    }
+
+    fn desired_cpufreq_enabled(&self) -> bool {
+        if self.opts.no_cpufreq {
+            return false;
+        }
+        if self.opts.cpufreq {
+            return true;
+        }
+        Self::detect_cpufreq_enabled()
+    }
+
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         try_set_rlimit_infinity();
 
@@ -596,7 +637,19 @@ impl<'a> Scheduler<'a> {
             opts.em_little_cost_pct,
         )?;
 
-        if let Err(err) = Self::init_cpufreq_perf(&mut skel, opts.cpufreq) {
+        let cpufreq_enabled = if opts.no_cpufreq {
+            info!("cpufreq control: forced off");
+            false
+        } else if opts.cpufreq {
+            info!("cpufreq control: forced on");
+            true
+        } else {
+            let enabled = Self::detect_cpufreq_enabled();
+            info!("cpufreq control: auto ({})", if enabled { "on" } else { "off" });
+            enabled
+        };
+
+        if let Err(err) = Self::init_cpufreq_perf(&mut skel, cpufreq_enabled) {
             bail!(
                 "failed to initialize cpufreq performance level: error {}",
                 err
@@ -629,6 +682,7 @@ impl<'a> Scheduler<'a> {
             power_profile,
             stats_server,
             user_restart: false,
+            cpufreq_enabled,
         })
     }
 
@@ -834,6 +888,16 @@ impl<'a> Scheduler<'a> {
     }
 
     fn refresh_sched_domain(&mut self) {
+        // Refresh cpufreq control independently from power-profile changes, as users may toggle
+        // intel_pstate / governors at runtime.
+        let cpufreq_enabled = self.desired_cpufreq_enabled();
+        if cpufreq_enabled != self.cpufreq_enabled {
+            self.cpufreq_enabled = cpufreq_enabled;
+            if let Err(err) = Self::init_cpufreq_perf(&mut self.skel, cpufreq_enabled) {
+                warn!("failed to refresh cpufreq performance level: error {}", err);
+            }
+        }
+
         if self.power_profile == PowerProfile::Unknown {
             return;
         }
@@ -868,9 +932,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        if let Err(err) = Self::init_cpufreq_perf(&mut self.skel, self.opts.cpufreq) {
-            warn!("failed to refresh cpufreq performance level: error {}", err);
-        }
+        // Note: cpufreq control is refreshed above (independent from power-profile changes).
     }
 
     fn enable_sibling_cpu(
