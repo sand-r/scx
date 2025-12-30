@@ -236,6 +236,7 @@ volatile u64 nr_idle_primary_picks, nr_idle_perf_picks, nr_idle_any_picks;
  * CPU performance hint statistics.
  */
 volatile u64 nr_cpuperf_updates, nr_cpuperf_idle_drops, nr_interactive_boosts;
+volatile u64 nr_cpuperf_max_reqs, nr_cpuperf_max_boosts;
 
 /*
  * Amount of currently running tasks.
@@ -1837,7 +1838,7 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 		const struct cpumask *perf = cast_mask(perf_cpumask);
 
 		if (perf && bpf_cpumask_test_cpu(cpu, perf))
-			perf_lvl = MIN(perf_lvl * 4, SCX_CPUPERF_ONE);
+			perf_lvl = SCX_CPUPERF_ONE;
 	}
 
 	/*
@@ -1863,6 +1864,8 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 				perf_lvl = aggressive_cpuperf ? (SCX_CPUPERF_ONE / 2) : 0;
 			else
 				perf_lvl = cctx->perf_lvl;
+			if (perf_lvl == SCX_CPUPERF_ONE)
+				__sync_fetch_and_add(&nr_cpuperf_max_reqs, 1);
 			scx_bpf_cpuperf_set(cpu, perf_lvl);
 			__sync_fetch_and_add(&nr_cpuperf_updates, 1);
 		}
@@ -1912,12 +1915,14 @@ void BPF_STRUCT_OPS(ext_running, struct task_struct *p)
 					cpuperf_lvl = cctx->perf_lvl;
 			}
 
-			if (boost_lvl > cpuperf_lvl) {
-				scx_bpf_cpuperf_set(cpu, boost_lvl);
-				__sync_fetch_and_add(&nr_interactive_boosts, 1);
+				if (boost_lvl > cpuperf_lvl) {
+					if (boost_lvl == SCX_CPUPERF_ONE)
+						__sync_fetch_and_add(&nr_cpuperf_max_boosts, 1);
+					scx_bpf_cpuperf_set(cpu, boost_lvl);
+					__sync_fetch_and_add(&nr_interactive_boosts, 1);
+				}
 			}
 		}
-	}
 
 	/*
 	 * Update the global vruntime as a new task is starting to use a

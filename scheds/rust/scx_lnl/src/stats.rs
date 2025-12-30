@@ -37,13 +37,17 @@ pub struct Metrics {
     pub nr_cpuperf_idle_drops: u64,
     #[stat(desc = "Number of interactive cpuperf boosts")]
     pub nr_interactive_boosts: u64,
+    #[stat(desc = "Number of cpuperf max requests from load tracking")]
+    pub nr_cpuperf_max_reqs: u64,
+    #[stat(desc = "Number of cpuperf max requests from interactive boosts")]
+    pub nr_cpuperf_max_boosts: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5} | idle_pick -> pri: {:<5} perf: {:<5} any: {:<5}",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5} max: {:<5} | idle_pick -> pri: {:<5} perf: {:<5} any: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
@@ -53,6 +57,7 @@ impl Metrics {
             self.nr_cpuperf_updates,
             self.nr_cpuperf_idle_drops,
             self.nr_interactive_boosts,
+            self.nr_cpuperf_max_reqs,
             self.nr_idle_primary_picks,
             self.nr_idle_perf_picks,
             self.nr_idle_any_picks,
@@ -71,6 +76,8 @@ impl Metrics {
             nr_cpuperf_updates: self.nr_cpuperf_updates - rhs.nr_cpuperf_updates,
             nr_cpuperf_idle_drops: self.nr_cpuperf_idle_drops - rhs.nr_cpuperf_idle_drops,
             nr_interactive_boosts: self.nr_interactive_boosts - rhs.nr_interactive_boosts,
+            nr_cpuperf_max_reqs: self.nr_cpuperf_max_reqs - rhs.nr_cpuperf_max_reqs,
+            nr_cpuperf_max_boosts: self.nr_cpuperf_max_boosts - rhs.nr_cpuperf_max_boosts,
             ..self.clone()
         }
     }

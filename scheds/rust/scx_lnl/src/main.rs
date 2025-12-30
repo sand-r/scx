@@ -1011,6 +1011,8 @@ impl<'a> Scheduler<'a> {
             nr_cpuperf_updates: bss_data.nr_cpuperf_updates,
             nr_cpuperf_idle_drops: bss_data.nr_cpuperf_idle_drops,
             nr_interactive_boosts: bss_data.nr_interactive_boosts,
+            nr_cpuperf_max_reqs: bss_data.nr_cpuperf_max_reqs,
+            nr_cpuperf_max_boosts: bss_data.nr_cpuperf_max_boosts,
         }
     }
 
