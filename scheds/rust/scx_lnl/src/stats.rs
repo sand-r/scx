@@ -43,7 +43,7 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5}",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5} | idle_pick -> pri: {:<5} perf: {:<5} any: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
@@ -53,6 +53,9 @@ impl Metrics {
             self.nr_cpuperf_updates,
             self.nr_cpuperf_idle_drops,
             self.nr_interactive_boosts,
+            self.nr_idle_primary_picks,
+            self.nr_idle_perf_picks,
+            self.nr_idle_any_picks,
         )?;
         Ok(())
     }
