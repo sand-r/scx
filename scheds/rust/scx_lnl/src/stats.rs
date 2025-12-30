@@ -25,19 +25,34 @@ pub struct Metrics {
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Number of regular task dispatches")]
     pub nr_shared_dispatches: u64,
+    #[stat(desc = "Number of built-in idle CPU picks in the primary domain")]
+    pub nr_idle_primary_picks: u64,
+    #[stat(desc = "Number of built-in idle CPU picks in the perf domain")]
+    pub nr_idle_perf_picks: u64,
+    #[stat(desc = "Number of built-in idle CPU picks without domain preference")]
+    pub nr_idle_any_picks: u64,
+    #[stat(desc = "Number of cpuperf updates from load tracking")]
+    pub nr_cpuperf_updates: u64,
+    #[stat(desc = "Number of cpuperf drops on idle CPUs")]
+    pub nr_cpuperf_idle_drops: u64,
+    #[stat(desc = "Number of interactive cpuperf boosts")]
+    pub nr_interactive_boosts: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5}",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
             self.nr_kthread_dispatches,
             self.nr_direct_dispatches,
-            self.nr_shared_dispatches
+            self.nr_shared_dispatches,
+            self.nr_cpuperf_updates,
+            self.nr_cpuperf_idle_drops,
+            self.nr_interactive_boosts,
         )?;
         Ok(())
     }
@@ -47,6 +62,12 @@ impl Metrics {
             nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
+            nr_idle_primary_picks: self.nr_idle_primary_picks - rhs.nr_idle_primary_picks,
+            nr_idle_perf_picks: self.nr_idle_perf_picks - rhs.nr_idle_perf_picks,
+            nr_idle_any_picks: self.nr_idle_any_picks - rhs.nr_idle_any_picks,
+            nr_cpuperf_updates: self.nr_cpuperf_updates - rhs.nr_cpuperf_updates,
+            nr_cpuperf_idle_drops: self.nr_cpuperf_idle_drops - rhs.nr_cpuperf_idle_drops,
+            nr_interactive_boosts: self.nr_interactive_boosts - rhs.nr_interactive_boosts,
             ..self.clone()
         }
     }

@@ -177,6 +177,16 @@ volatile s64 cpufreq_perf_lvl;
 volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
 
 /*
+ * Policy statistics.
+ */
+volatile u64 nr_idle_primary_picks, nr_idle_perf_picks, nr_idle_any_picks;
+
+/*
+ * CPU performance hint statistics.
+ */
+volatile u64 nr_cpuperf_updates, nr_cpuperf_idle_drops, nr_interactive_boosts;
+
+/*
  * Amount of currently running tasks.
  */
 volatile u64 nr_running;
@@ -869,12 +879,18 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 
 	cpu = primary_all ? -ENOENT :
 			scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, primary, 0);
-	if (cpu < 0 && perf)
+	if (cpu >= 0)
+		__sync_fetch_and_add(&nr_idle_primary_picks, 1);
+	if (cpu < 0 && perf) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, perf, 0);
+		if (cpu >= 0)
+			__sync_fetch_and_add(&nr_idle_perf_picks, 1);
+	}
 	if (cpu < 0) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
 		if (cpu < 0)
 			return prev_cpu;
+		__sync_fetch_and_add(&nr_idle_any_picks, 1);
 	}
 	*is_idle = true;
 
@@ -1649,8 +1665,10 @@ void BPF_STRUCT_OPS(ext_dispatch, s32 cpu, struct task_struct *prev)
 	 * Drop the cpuperf request so we don't keep a high HWP desired value
 	 * lingering on otherwise idle CPUs.
 	 */
-	if (cpufreq_perf_lvl == -1)
+	if (cpufreq_perf_lvl == -1) {
 		scx_bpf_cpuperf_set(cpu, 0);
+		__sync_fetch_and_add(&nr_cpuperf_idle_drops, 1);
+	}
 }
 
 /*
@@ -1729,6 +1747,7 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 		else
 			perf_lvl = cctx->perf_lvl;
 		scx_bpf_cpuperf_set(cpu, perf_lvl);
+		__sync_fetch_and_add(&nr_cpuperf_updates, 1);
 	}
 
 	cctx->last_running = now;
@@ -1757,8 +1776,10 @@ void BPF_STRUCT_OPS(ext_running, struct task_struct *p)
 	 */
 	if (cpufreq_perf_lvl == -1 &&
 	    is_interactive(p, tctx) &&
-	    time_delta(now, tctx->last_wake_at) <= interactive_boost_ns)
+	    time_delta(now, tctx->last_wake_at) <= interactive_boost_ns) {
 		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), SCX_CPUPERF_ONE);
+		__sync_fetch_and_add(&nr_interactive_boosts, 1);
+	}
 
 	/*
 	 * Update the global vruntime as a new task is starting to use a

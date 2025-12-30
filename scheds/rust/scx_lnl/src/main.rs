@@ -963,6 +963,12 @@ impl<'a> Scheduler<'a> {
             nr_kthread_dispatches: bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_shared_dispatches: bss_data.nr_shared_dispatches,
+            nr_idle_primary_picks: bss_data.nr_idle_primary_picks,
+            nr_idle_perf_picks: bss_data.nr_idle_perf_picks,
+            nr_idle_any_picks: bss_data.nr_idle_any_picks,
+            nr_cpuperf_updates: bss_data.nr_cpuperf_updates,
+            nr_cpuperf_idle_drops: bss_data.nr_cpuperf_idle_drops,
+            nr_interactive_boosts: bss_data.nr_interactive_boosts,
         }
     }
 
