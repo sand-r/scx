@@ -97,6 +97,15 @@ const volatile u64 interactive_nvcsw_thresh = 4ULL;
 const volatile u64 interactive_boost_ns = 20ULL * NSEC_PER_MSEC;
 
 /*
+ * Prefer selecting an idle CPU in the perf domain for interactive tasks.
+ *
+ * This is typically enabled in performance-oriented profiles to prioritize
+ * P-cores for latency-sensitive work while still allowing the primary domain
+ * to include all CPUs for throughput.
+ */
+const volatile bool prefer_perf_for_interactive;
+
+/*
  * Target cpuperf level used for interactive boosts (0..SCX_CPUPERF_ONE).
  *
  * This is a floor - the scheduler won't reduce the cpuperf request if the
@@ -896,19 +905,32 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 	if (allow_non_primary && is_interactive(p, tctx))
 		perf = cast_mask(perf_cpumask);
 
-	cpu = primary_all ? -ENOENT :
-			scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, primary, 0);
-	if (cpu >= 0)
-		__sync_fetch_and_add(&nr_idle_primary_picks, 1);
+	if (perf && prefer_perf_for_interactive) {
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, perf, 0);
+		if (cpu >= 0)
+			__sync_fetch_and_add(&nr_idle_perf_picks, 1);
+	} else {
+		cpu = -ENOENT;
+	}
+
+	if (cpu < 0) {
+		cpu = primary_all ? -ENOENT :
+				scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, primary, 0);
+		if (cpu >= 0)
+			__sync_fetch_and_add(&nr_idle_primary_picks, 1);
+	}
+
 	if (cpu < 0 && !allow_non_primary) {
 		*is_idle = false;
 		return prev_cpu;
 	}
-	if (cpu < 0 && perf) {
+
+	if (cpu < 0 && perf && !prefer_perf_for_interactive) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, perf, 0);
 		if (cpu >= 0)
 			__sync_fetch_and_add(&nr_idle_perf_picks, 1);
 	}
+
 	if (cpu < 0) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
 		if (cpu < 0)

@@ -528,6 +528,7 @@ impl<'a> Scheduler<'a> {
         rodata.primary_all = domain.weight() == *NR_CPU_IDS;
         rodata.interactive_nvcsw_thresh = opts.interactive_nvcsw_thresh;
         rodata.interactive_boost_ns = opts.interactive_boost_ms * 1_000_000;
+        rodata.prefer_perf_for_interactive = power_profile == PowerProfile::Performance;
         rodata.interactive_boost_perf_lvl = opts.interactive_boost_lvl.min(1024);
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
@@ -687,7 +688,7 @@ impl<'a> Scheduler<'a> {
                 PowerProfile::Balanced { power: false } | PowerProfile::Unknown => {
                     Self::epp_to_cpumask(Powermode::Powersave)?
                 }
-                PowerProfile::Performance => Self::epp_to_cpumask(Powermode::Performance)?,
+                PowerProfile::Performance => Self::epp_to_cpumask(Powermode::Any)?,
             },
             "all" => Self::epp_to_cpumask(Powermode::Any)?,
             &_ => Cpumask::from_str(primary_domain)?,
