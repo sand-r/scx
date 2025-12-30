@@ -687,7 +687,7 @@ impl<'a> Scheduler<'a> {
                 PowerProfile::Balanced { power: false } | PowerProfile::Unknown => {
                     Self::epp_to_cpumask(Powermode::Powersave)?
                 }
-                PowerProfile::Performance => Self::epp_to_cpumask(Powermode::Any)?,
+                PowerProfile::Performance => Self::epp_to_cpumask(Powermode::Performance)?,
             },
             "all" => Self::epp_to_cpumask(Powermode::Any)?,
             &_ => Cpumask::from_str(primary_domain)?,
