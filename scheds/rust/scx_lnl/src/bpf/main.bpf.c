@@ -1808,9 +1808,17 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	perf_lvl = MIN(delta_runtime * SCX_CPUPERF_ONE / delta_t, SCX_CPUPERF_ONE);
 
 	/*
+	 * In performance profile, boost big-core cpuperf requests to reach higher
+	 * frequencies sooner. Some workloads (e.g. frame-based rendering) are
+	 * frequency-sensitive even at moderate utilization.
+	 */
+	if (aggressive_cpuperf && cpu_is_big[cpu])
+		perf_lvl = MIN(perf_lvl * 2, SCX_CPUPERF_ONE);
+
+	/*
 	 * Use a moving average to evaluate the target performance level,
 	 * giving more priority to the current average, so that we can
-	 * react faster at CPU load variations and at the same time smooth
+		 * react faster at CPU load variations and at the same time smooth
 	 * the short spikes.
 	 */
 	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
