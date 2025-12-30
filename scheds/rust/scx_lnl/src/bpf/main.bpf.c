@@ -12,6 +12,13 @@
 extern unsigned CONFIG_HZ __kconfig;
 
 /*
+ * When running in performance profile, keep cpuperf requests for a short window
+ * after a CPU goes idle to avoid frequency down/up oscillations on bursty,
+ * frame-based workloads (e.g. web rendering, animation).
+ */
+#define PERF_IDLE_RETAIN_NS	(20ULL * NSEC_PER_MSEC)
+
+/*
  * Return the time interval between two ticks in ns.
  */
 static inline u64 tick_interval_ns(void)
@@ -1755,6 +1762,15 @@ void BPF_STRUCT_OPS(ext_dispatch, s32 cpu, struct task_struct *prev)
 	 * lingering on otherwise idle CPUs.
 	 */
 	if (cpufreq_perf_lvl == -1) {
+		if (aggressive_cpuperf) {
+			struct cpu_ctx *cctx;
+			u64 now = scx_bpf_now();
+
+			cctx = try_lookup_cpu_ctx(cpu);
+			if (cctx && time_delta(now, cctx->last_running) <= PERF_IDLE_RETAIN_NS)
+				return;
+		}
+
 		scx_bpf_cpuperf_set(cpu, 0);
 		__sync_fetch_and_add(&nr_cpuperf_idle_drops, 1);
 	}
