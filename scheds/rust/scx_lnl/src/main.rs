@@ -535,6 +535,7 @@ impl<'a> Scheduler<'a> {
         let auto_domain = opts.primary_domain == "auto";
         rodata.prefer_perf_for_interactive = perf_profile && auto_domain;
         rodata.aggressive_overflow = perf_profile && auto_domain;
+        rodata.aggressive_cpuperf = perf_profile;
         rodata.interactive_boost_perf_lvl = opts.interactive_boost_lvl.min(1024);
 
         // Normalize CPU busy threshold in the range [0 .. 1024].

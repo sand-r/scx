@@ -117,6 +117,16 @@ const volatile bool prefer_perf_for_interactive;
 const volatile bool aggressive_overflow;
 
 /*
+ * More aggressive CPU performance hinting in performance profile.
+ *
+ * When enabled, avoid dropping cpuperf requests all the way to the floor for
+ * moderately utilized CPUs. This helps latency/throughput sensitive workloads
+ * that need higher single-thread performance even if the steady-state CPU
+ * utilization is not high (e.g. frame-based rendering).
+ */
+const volatile bool aggressive_cpuperf;
+
+/*
  * Target cpuperf level used for interactive boosts (0..SCX_CPUPERF_ONE).
  *
  * This is a floor - the scheduler won't reduce the cpuperf request if the
@@ -1813,16 +1823,16 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 *  - if it's below the low threshold, scale down to half capacity;
 	 *  - otherwise, maintain the smoothed perf level.
 	 */
-	if (cpufreq_perf_lvl == -1) {
-		if (cctx->perf_lvl >= CPUFREQ_HIGH_THRESH)
-			perf_lvl = SCX_CPUPERF_ONE;
-		else if (cctx->perf_lvl <= CPUFREQ_LOW_THRESH)
-			perf_lvl = 0;
-		else
-			perf_lvl = cctx->perf_lvl;
-		scx_bpf_cpuperf_set(cpu, perf_lvl);
-		__sync_fetch_and_add(&nr_cpuperf_updates, 1);
-	}
+		if (cpufreq_perf_lvl == -1) {
+			if (cctx->perf_lvl >= CPUFREQ_HIGH_THRESH)
+				perf_lvl = SCX_CPUPERF_ONE;
+			else if (cctx->perf_lvl <= CPUFREQ_LOW_THRESH)
+				perf_lvl = aggressive_cpuperf ? (SCX_CPUPERF_ONE / 2) : 0;
+			else
+				perf_lvl = cctx->perf_lvl;
+			scx_bpf_cpuperf_set(cpu, perf_lvl);
+			__sync_fetch_and_add(&nr_cpuperf_updates, 1);
+		}
 
 	cctx->last_running = now;
 	cctx->prev_runtime = cctx->tot_runtime;
@@ -2206,7 +2216,7 @@ static void init_cpuperf_target(void)
 		 * request before we collect any load signals).
 		 */
 		if (cpufreq_perf_lvl == -1) {
-			perf_lvl = 0;
+			perf_lvl = aggressive_cpuperf ? (SCX_CPUPERF_ONE / 2) : 0;
 			scx_bpf_cpuperf_set(cpu, perf_lvl);
 		} else if (cpufreq_perf_lvl >= 0) {
 			perf_lvl = MIN(cpufreq_perf_lvl, SCX_CPUPERF_ONE);
