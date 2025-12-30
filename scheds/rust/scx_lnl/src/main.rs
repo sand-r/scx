@@ -339,6 +339,15 @@ struct Opts {
     #[clap(long, default_value = "20")]
     interactive_boost_ms: u64,
 
+    /// cpuperf level used for interactive boosts when `--cpufreq` is enabled (0-1024).
+    ///
+    /// Lower values reduce frequency overshoots and power draw for bursty workloads (e.g. browsing)
+    /// at the cost of slightly lower peak responsiveness.
+    ///
+    /// (0 = disable interactive cpuperf boosting).
+    #[clap(long, default_value = "512")]
+    interactive_boost_lvl: u64,
+
     /// Energy model scaling factor (percent) applied to big-core energy costs.
     #[clap(long, default_value = "100")]
     em_big_cost_pct: u32,
@@ -519,6 +528,7 @@ impl<'a> Scheduler<'a> {
         rodata.primary_all = domain.weight() == *NR_CPU_IDS;
         rodata.interactive_nvcsw_thresh = opts.interactive_nvcsw_thresh;
         rodata.interactive_boost_ns = opts.interactive_boost_ms * 1_000_000;
+        rodata.interactive_boost_perf_lvl = opts.interactive_boost_lvl.min(1024);
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
         rodata.cpu_busy_thresh = if opts.cpu_busy_thresh < 0 {

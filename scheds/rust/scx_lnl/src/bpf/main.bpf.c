@@ -97,6 +97,14 @@ const volatile u64 interactive_nvcsw_thresh = 4ULL;
 const volatile u64 interactive_boost_ns = 20ULL * NSEC_PER_MSEC;
 
 /*
+ * Target cpuperf level used for interactive boosts (0..SCX_CPUPERF_ONE).
+ *
+ * This is a floor - the scheduler won't reduce the cpuperf request if the
+ * CPU is already requesting a higher level based on load.
+ */
+const volatile u64 interactive_boost_perf_lvl = SCX_CPUPERF_ONE / 2;
+
+/*
  * CPU utilization threshold to consider the CPU as busy.
  */
 const volatile s64 cpu_busy_thresh = -1LL;
@@ -848,6 +856,8 @@ static bool cpus_share_llc(s32 this_cpu, s32 that_cpu)
 	return bpf_cpumask_test_cpu(this_cpu, llc_mask);
 }
 
+static bool is_cpu_busy(s32 cpu);
+
 /*
  * Compatibility helper to transparently use the built-in idle CPU
  * selection policy (if scx_bpf_select_cpu_and() is available) or fallback
@@ -858,6 +868,7 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 {
 	const struct cpumask *primary;
 	const struct cpumask *perf = NULL;
+	bool allow_non_primary;
 	s32 cpu;
 
 	if (!builtin_idle || !bpf_ksym_exists(scx_bpf_select_cpu_and))
@@ -871,16 +882,28 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 		wake_flags &= ~SCX_WAKE_SYNC;
 
 	/*
+	 * Avoid waking up non-primary CPUs unless the primary domain is saturated
+	 * (or if the task can't use any primary CPU at all).
+	 */
+	allow_non_primary = primary_all ||
+			    !bpf_cpumask_intersects(primary, p->cpus_ptr) ||
+			    is_cpu_busy(prev_cpu);
+
+	/*
 	 * Default to picking an idle CPU in the primary (typically energy)
 	 * domain. Use the perf domain only as an escape hatch.
 	 */
-	if (is_interactive(p, tctx))
+	if (allow_non_primary && is_interactive(p, tctx))
 		perf = cast_mask(perf_cpumask);
 
 	cpu = primary_all ? -ENOENT :
 			scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, primary, 0);
 	if (cpu >= 0)
 		__sync_fetch_and_add(&nr_idle_primary_picks, 1);
+	if (cpu < 0 && !allow_non_primary) {
+		*is_idle = false;
+		return prev_cpu;
+	}
 	if (cpu < 0 && perf) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, perf, 0);
 		if (cpu >= 0)
@@ -915,6 +938,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	int node;
 	s32 this_cpu = bpf_get_smp_processor_id(), cpu;
 	bool is_prev_allowed;
+	bool allow_non_primary;
 
 	primary = cast_mask(primary_cpumask);
 	if (!primary)
@@ -947,6 +971,10 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 */
 	is_prev_allowed = (primary_all || sticky_cpu) ? true :
 				p_mask && bpf_cpumask_test_cpu(prev_cpu, p_mask);
+
+	allow_non_primary = primary_all ||
+			    !bpf_cpumask_intersects(primary, p->cpus_ptr) ||
+			    is_cpu_busy(prev_cpu);
 
 	/*
 	 * Acquire the CPU masks to determine the idle CPUs in the system.
@@ -1085,7 +1113,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		/*
 		 * Search for any full-idle CPU usable by the task.
 		 */
-		if (p_mask != p->cpus_ptr) {
+		if (allow_non_primary && p_mask != p->cpus_ptr) {
 			cpu = pick_idle_cpu_node(p->cpus_ptr, node,
 						SCX_PICK_IDLE_CORE);
 			if (cpu >= 0) {
@@ -1144,7 +1172,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	/*
 	 * Search for any idle CPU usable by the task.
 	 */
-	if (p_mask != p->cpus_ptr) {
+	if (allow_non_primary && p_mask != p->cpus_ptr) {
 		cpu = pick_idle_cpu_node(p->cpus_ptr, node, 0);
 		if (cpu >= 0) {
 			*is_idle = true;
@@ -1583,6 +1611,17 @@ static bool keep_running(const struct task_struct *p, s32 cpu)
 
 		if (time_delta(scx_bpf_now(), tctx->last_wake_at) > interactive_boost_ns)
 			return false;
+
+		/*
+		 * Avoid keeping perf cores awake if there are idle primary CPUs
+		 * available. The perf domain is an escape hatch when the primary
+		 * domain is saturated.
+		 */
+		idle_cpumask = get_idle_cpumask_node(node);
+		ret = idle_cpumask && bpf_cpumask_intersects(primary, idle_cpumask);
+		scx_bpf_put_cpumask(idle_cpumask);
+		if (ret)
+			return false;
 	}
 
 	/*
@@ -1777,8 +1816,29 @@ void BPF_STRUCT_OPS(ext_running, struct task_struct *p)
 	if (cpufreq_perf_lvl == -1 &&
 	    is_interactive(p, tctx) &&
 	    time_delta(now, tctx->last_wake_at) <= interactive_boost_ns) {
-		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), SCX_CPUPERF_ONE);
-		__sync_fetch_and_add(&nr_interactive_boosts, 1);
+		s32 cpu = scx_bpf_task_cpu(p);
+		struct cpu_ctx *cctx;
+		u64 boost_lvl, cpuperf_lvl = 0;
+
+		boost_lvl = MIN(interactive_boost_perf_lvl, SCX_CPUPERF_ONE);
+		if (boost_lvl) {
+			/*
+			 * The load tracker already requested a cpuperf level for this CPU.
+			 * Apply the interactive boost only if it would increase the request.
+			 */
+			cctx = try_lookup_cpu_ctx(cpu);
+			if (cctx) {
+				if (cctx->perf_lvl >= CPUFREQ_HIGH_THRESH)
+					cpuperf_lvl = SCX_CPUPERF_ONE;
+				else if (cctx->perf_lvl > CPUFREQ_LOW_THRESH)
+					cpuperf_lvl = cctx->perf_lvl;
+			}
+
+			if (boost_lvl > cpuperf_lvl) {
+				scx_bpf_cpuperf_set(cpu, boost_lvl);
+				__sync_fetch_and_add(&nr_interactive_boosts, 1);
+			}
+		}
 	}
 
 	/*
