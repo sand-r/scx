@@ -13,6 +13,7 @@ main.rs or \*.bpf.c files.
 # Schedulers
 
 - [scx_bpfland](scx_bpfland/README.md)
+- [scx_lnl](scx_lnl/README.md)
 - [scx_flash](scx_flash/README.md)
 - [scx_cosmos](scx_cosmos/README.md)
 - [scx_lavd](scx_lavd/README.md)

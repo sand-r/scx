@@ -5,6 +5,7 @@ target
 build/
 *.swp
 .cache/
+.ccache/
 .vscode/
 tags
 *.o
