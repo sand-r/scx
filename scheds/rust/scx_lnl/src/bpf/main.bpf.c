@@ -1821,7 +1821,7 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 		const struct cpumask *perf = cast_mask(perf_cpumask);
 
 		if (perf && bpf_cpumask_test_cpu(cpu, perf))
-			perf_lvl = MIN(perf_lvl * 2, SCX_CPUPERF_ONE);
+			perf_lvl = MIN(perf_lvl * 4, SCX_CPUPERF_ONE);
 	}
 
 	/*
