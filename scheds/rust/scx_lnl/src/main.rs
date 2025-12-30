@@ -528,8 +528,13 @@ impl<'a> Scheduler<'a> {
         rodata.primary_all = domain.weight() == *NR_CPU_IDS;
         rodata.interactive_nvcsw_thresh = opts.interactive_nvcsw_thresh;
         rodata.interactive_boost_ns = opts.interactive_boost_ms * 1_000_000;
-        rodata.prefer_perf_for_interactive = power_profile == PowerProfile::Performance;
-        rodata.aggressive_overflow = power_profile == PowerProfile::Performance;
+        // Power-profile-driven knobs should only apply when using auto domain selection.
+        // If the user explicitly pins the primary domain (e.g. `--primary-domain powersave`),
+        // honor that choice and avoid silently pulling work into the perf domain.
+        let perf_profile = power_profile == PowerProfile::Performance;
+        let auto_domain = opts.primary_domain == "auto";
+        rodata.prefer_perf_for_interactive = perf_profile && auto_domain;
+        rodata.aggressive_overflow = perf_profile && auto_domain;
         rodata.interactive_boost_perf_lvl = opts.interactive_boost_lvl.min(1024);
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
