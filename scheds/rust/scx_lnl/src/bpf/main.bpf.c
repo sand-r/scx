@@ -72,6 +72,15 @@ const volatile bool debug;
 /* Enable round-robin mode */
 const volatile bool rr_sched;
 
+/*
+ * Enable energy-model-based CPU selection.
+ *
+ * When enabled, scx_lnl uses the userspace-provided energy model inputs
+ * (cpu_capacity / cpu_energy_cost) to rank idle CPUs and will prefer the
+ * most energy-efficient CPU within the candidate set.
+ */
+const volatile bool energy_aware;
+
 /* Primary domain includes all CPU */
 /*
  * True if the primary domain includes all CPUs.
@@ -326,6 +335,40 @@ private(EXT) struct bpf_cpumask __kptr *perf_cpumask;
 u16 cpu_capacity[NR_CPUS];
 u16 cpu_energy_cost[NR_CPUS];
 u8 cpu_is_big[NR_CPUS];
+
+/*
+ * Energy model helpers.
+ *
+ * cpu_capacity: relative capacity (0-1024), higher means faster
+ * cpu_energy_cost: normalized cost coefficient (lower is more efficient)
+ */
+static __always_inline u32 get_cpu_capacity(s32 cpu)
+{
+	if (cpu < 0 || cpu >= NR_CPUS)
+		return 1024;
+	return cpu_capacity[cpu] ? cpu_capacity[cpu] : 1024;
+}
+
+static __always_inline u32 get_cpu_energy_cost(s32 cpu)
+{
+	if (cpu < 0 || cpu >= NR_CPUS)
+		return 1024;
+	return cpu_energy_cost[cpu] ? cpu_energy_cost[cpu] : 1024;
+}
+
+/*
+ * Compute an efficiency score for a CPU (higher is better).
+ *
+ * The score is proportional to performance-per-watt using the energy model
+ * coefficients provided by user space.
+ */
+static __always_inline u64 cpu_efficiency_score(s32 cpu)
+{
+	u64 cap = get_cpu_capacity(cpu);
+	u64 cost = MAX(get_cpu_energy_cost(cpu), 1);
+
+	return (cap * 1024) / cost;
+}
 
 /*
  * CPUs in the system have SMT is enabled.
@@ -628,6 +671,85 @@ static s32 pick_idle_cpu_node(const struct cpumask *cpus_allowed, int node, u64 
 	return numa_disabled ?
 		scx_bpf_pick_idle_cpu(cpus_allowed, flags) :
 	       __COMPAT_scx_bpf_pick_idle_cpu_node(cpus_allowed, node, flags);
+}
+
+/*
+ * Return an idle cpumask, honoring NUMA and "in-node" selection flags.
+ *
+ * If NUMA is disabled, always return the global idle masks.
+ */
+static const struct cpumask *get_idle_mask_flags(int node, u64 flags, bool full_idle)
+{
+	if (numa_disabled)
+		return full_idle ? scx_bpf_get_idle_smtmask() :
+				   scx_bpf_get_idle_cpumask();
+
+	if (flags & __COMPAT_SCX_PICK_IDLE_IN_NODE)
+		return full_idle ? __COMPAT_scx_bpf_get_idle_smtmask_node(node) :
+				   __COMPAT_scx_bpf_get_idle_cpumask_node(node);
+
+	return full_idle ? scx_bpf_get_idle_smtmask() :
+			   scx_bpf_get_idle_cpumask();
+}
+
+/*
+ * Pick an idle CPU in @cpus_allowed, ranking candidates using the energy model.
+ *
+ * Returns a CPU with its idle state claimed via scx_bpf_test_and_clear_cpu_idle(),
+ * or -ENOENT if no suitable CPU is found.
+ */
+static s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int node, u64 flags,
+				     s32 prev_cpu)
+{
+	const struct cpumask *idle;
+	bool full_idle = flags & SCX_PICK_IDLE_CORE;
+	s32 cpu, best_cpu = -1;
+	u64 best_score = 0;
+	u32 best_cost = 0;
+
+	if (!cpus_allowed)
+		return -ENOENT;
+
+	/*
+	 * No need to look for full-idle SMT cores if SMT is disabled.
+	 */
+	if (full_idle && !smt_enabled)
+		full_idle = false;
+
+	idle = get_idle_mask_flags(node, flags, full_idle);
+	if (!idle)
+		return -ENOENT;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		u64 score;
+		u32 cost;
+
+		if (!bpf_cpumask_test_cpu(cpu, cpus_allowed))
+			continue;
+		if (!bpf_cpumask_test_cpu(cpu, idle))
+			continue;
+
+		score = cpu_efficiency_score(cpu);
+		cost = get_cpu_energy_cost(cpu);
+
+		if (best_cpu < 0 || score > best_score ||
+		    (score == best_score && cost < best_cost) ||
+		    (score == best_score && cost == best_cost && cpu == prev_cpu)) {
+			best_cpu = cpu;
+			best_score = score;
+			best_cost = cost;
+		}
+	}
+
+	scx_bpf_put_cpumask(idle);
+
+	if (best_cpu < 0)
+		return -ENOENT;
+
+	if (!scx_bpf_test_and_clear_cpu_idle(best_cpu))
+		return -ENOENT;
+
+	return best_cpu;
 }
 
 /*
@@ -1002,6 +1124,10 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 	bool allow_non_primary;
 	s32 cpu;
 
+	/* Use the custom policy when energy-aware selection is enabled. */
+	if (energy_aware)
+		return -ENOENT;
+
 	if (!builtin_idle || !bpf_ksym_exists(scx_bpf_select_cpu_and))
 		return -ENOENT;
 
@@ -1218,7 +1344,13 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		 * shares the same L2 cache.
 		 */
 		if (l2_mask) {
-			cpu = pick_idle_cpu_node(l2_mask, node, SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
+			if (energy_aware)
+				cpu = pick_idle_cpu_node_energy(l2_mask, node,
+								SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE,
+								prev_cpu);
+			else
+				cpu = pick_idle_cpu_node(l2_mask, node,
+							 SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
@@ -1230,7 +1362,13 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		 * shares the same L3 cache.
 		 */
 		if (l3_mask) {
-			cpu = pick_idle_cpu_node(l3_mask, node, SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
+			if (energy_aware)
+				cpu = pick_idle_cpu_node_energy(l3_mask, node,
+								SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE,
+								prev_cpu);
+			else
+				cpu = pick_idle_cpu_node(l3_mask, node,
+							 SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
@@ -1249,7 +1387,10 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 			if (!node_rebalance(node))
 				flags |= __COMPAT_SCX_PICK_IDLE_IN_NODE;
 
-			cpu = pick_idle_cpu_node(p_mask, node, flags);
+			if (energy_aware)
+				cpu = pick_idle_cpu_node_energy(p_mask, node, flags, prev_cpu);
+			else
+				cpu = pick_idle_cpu_node(p_mask, node, flags);
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
@@ -1260,8 +1401,12 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		 * Search for any full-idle CPU usable by the task.
 		 */
 		if (allow_non_primary && !primary_all) {
-			cpu = pick_idle_cpu_node(p->cpus_ptr, node,
-						SCX_PICK_IDLE_CORE);
+			if (energy_aware)
+				cpu = pick_idle_cpu_node_energy(p->cpus_ptr, node,
+								SCX_PICK_IDLE_CORE, prev_cpu);
+			else
+				cpu = pick_idle_cpu_node(p->cpus_ptr, node,
+							 SCX_PICK_IDLE_CORE);
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
@@ -1285,7 +1430,11 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 * L2 cache.
 	 */
 	if (l2_mask && !node_rebalance(node)) {
-		cpu = pick_idle_cpu_node(l2_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
+		if (energy_aware)
+			cpu = pick_idle_cpu_node_energy(l2_mask, node,
+							__COMPAT_SCX_PICK_IDLE_IN_NODE, prev_cpu);
+		else
+			cpu = pick_idle_cpu_node(l2_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -1297,7 +1446,11 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 * L3 cache.
 	 */
 	if (l3_mask && !node_rebalance(node)) {
-		cpu = pick_idle_cpu_node(l3_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
+		if (energy_aware)
+			cpu = pick_idle_cpu_node_energy(l3_mask, node,
+							__COMPAT_SCX_PICK_IDLE_IN_NODE, prev_cpu);
+		else
+			cpu = pick_idle_cpu_node(l3_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -1308,7 +1461,10 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 * Search for any idle CPU in the scheduling domain.
 	 */
 	if (p_mask) {
-		cpu = pick_idle_cpu_node(p_mask, node, 0);
+		if (energy_aware)
+			cpu = pick_idle_cpu_node_energy(p_mask, node, 0, prev_cpu);
+		else
+			cpu = pick_idle_cpu_node(p_mask, node, 0);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -1319,7 +1475,10 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 * Search for any idle CPU usable by the task.
 	 */
 	if (allow_non_primary && !primary_all) {
-		cpu = pick_idle_cpu_node(p->cpus_ptr, node, 0);
+		if (energy_aware)
+			cpu = pick_idle_cpu_node_energy(p->cpus_ptr, node, 0, prev_cpu);
+		else
+			cpu = pick_idle_cpu_node(p->cpus_ptr, node, 0);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;

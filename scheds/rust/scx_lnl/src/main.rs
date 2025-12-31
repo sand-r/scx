@@ -256,6 +256,17 @@ struct Opts {
     #[clap(short = 'b', long, action = clap::ArgAction::SetTrue)]
     no_builtin_idle: bool,
 
+    /// Enable energy-model-based CPU selection (experimental).
+    ///
+    /// When enabled, scx_lnl will rank idle CPUs using userspace-provided energy model inputs
+    /// (`cpu_capacity` / `cpu_energy_cost`) and prefer the most energy-efficient CPU within the
+    /// candidate set.
+    ///
+    /// This forces the scheduler to use the custom CPU selection policy (built-in idle selection
+    /// is skipped).
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    energy_aware: bool,
+
     /// Enable per-CPU tasks prioritization.
     ///
     /// Enabling this option allows to prioritize per-CPU tasks that usually tend to be
@@ -593,6 +604,7 @@ impl<'a> Scheduler<'a> {
         rodata.native_priority = opts.native_priority;
         rodata.slice_lag_scaling = opts.slice_lag_scaling;
         rodata.builtin_idle = !opts.no_builtin_idle;
+        rodata.energy_aware = opts.energy_aware;
         rodata.slice_max = opts.slice_us * 1000;
         rodata.slice_min = opts.slice_us_min * 1000;
         rodata.slice_lag = opts.slice_us_lag * 1000;

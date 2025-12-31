@@ -60,6 +60,15 @@ Overrides:
 In performance profile (with `--primary-domain auto`), `scx_lnl` requests max cpuperf on the perf
 domain to enable peak boost when needed.
 
+## Energy Model (CPU Selection)
+
+`scx_lnl` can optionally use the kernel energy model (as exported via sysfs and ingested by user
+space) to rank idle CPUs and prefer the most energy-efficient CPU within the candidate set.
+
+Enable with:
+
+- `--energy-aware`: use energy-model-based idle CPU ranking (experimental).
+
 ## Kernel Kconfig (`__kconfig` externs)
 
 The BPF side uses a small number of `__kconfig` externs (currently `CONFIG_HZ`) for timing.
@@ -174,6 +183,8 @@ The most relevant defaults for CPU placement and responsiveness:
   positives on some kernels (set to `0` to disable).
 - `--cpu-busy-thresh -1`: dynamic busy threshold (derived from global user CPU time) used to decide
   when a CPU is "busy" and should overflow more aggressively.
+- `--energy-aware`: optionally rank idle CPUs using energy model inputs (experimental; forces custom
+  CPU selection).
 
 In non-performance power profiles, `scx_lnl` tries hard to keep work on the primary domain (typically
 E-cores) and uses the perf domain (typically P-cores) as an escape hatch for interactive bursts when
