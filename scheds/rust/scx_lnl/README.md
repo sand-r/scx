@@ -58,6 +58,19 @@ Overrides:
 In performance profile (with `--primary-domain auto`), `scx_lnl` requests max cpuperf on the perf
 domain to enable peak boost when needed.
 
+## Kernel Kconfig (`__kconfig` externs)
+
+The BPF side uses a small number of `__kconfig` externs (currently `CONFIG_HZ`) for timing.
+
+If your kernel doesn't expose system Kconfig (e.g. missing `/proc/config.gz` and
+`/boot/config-$(uname -r)`), `scx_lnl` will try to auto-detect a config from:
+
+- `/boot/config-<release>`
+- `/lib/modules/<release>/build/.config`
+- `/lib/modules/<release>/build/include/config/auto.conf`
+
+You can also pass a config explicitly via `--kconfig <path>` (see `--help`).
+
 ## Usage
 
 ### Build

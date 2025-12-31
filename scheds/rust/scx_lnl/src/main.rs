@@ -17,6 +17,7 @@ use std::fmt::Write;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::mem::MaybeUninit;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -440,6 +441,23 @@ impl<'a> Scheduler<'a> {
             .filter(|s| !s.is_empty())
     }
 
+    fn kernel_release() -> Option<String> {
+        Self::read_sysfs_trim("/proc/sys/kernel/osrelease")
+    }
+
+    fn detect_kconfig_path() -> Option<String> {
+        let release = Self::kernel_release()?;
+        let candidates = [
+            format!("/boot/config-{}", release),
+            format!("/lib/modules/{}/build/.config", release),
+            format!("/lib/modules/{}/build/include/config/auto.conf", release),
+        ];
+
+        candidates
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+    }
+
     fn detect_cpufreq_enabled() -> bool {
         let governor = Self::read_sysfs_trim("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor");
         if governor.as_deref() != Some("schedutil") {
@@ -541,7 +559,14 @@ impl<'a> Scheduler<'a> {
         // Initialize BPF connector.
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
-        let open_opts = opts.libbpf.clone().into_bpf_open_opts();
+        let mut libbpf_opts = opts.libbpf.clone();
+        if libbpf_opts.kconfig.is_none() {
+            if let Some(kconfig_path) = Self::detect_kconfig_path() {
+                info!("Using libbpf kconfig: {}", kconfig_path);
+                libbpf_opts.kconfig = Some(kconfig_path);
+            }
+        }
+        let open_opts = libbpf_opts.into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, ext_ops, open_opts)?;
 
         skel.struct_ops.ext_ops_mut().exit_dump_len = opts.exit_dump_len;
