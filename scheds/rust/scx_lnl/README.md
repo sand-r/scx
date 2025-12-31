@@ -68,6 +68,20 @@ From the `scx/` repo root:
 cargo build -p scx_lnl --release
 ```
 
+### Install
+
+Recommended (system-wide, good for systemd):
+
+```bash
+sudo install -Dm755 ./target/release/scx_lnl /usr/local/bin/scx_lnl
+```
+
+Alternative (user-local):
+
+```bash
+cargo install --path scheds/rust/scx_lnl
+```
+
 ### Run
 
 Default (recommended):
@@ -94,6 +108,41 @@ sudo ./target/release/scx_lnl --stats 1
 
 `cpuperf -> max:` reports how often the scheduler requested max cpuperf from load tracking during
 the last interval.
+
+### Autostart After Boot (systemd)
+
+1) Create `/etc/systemd/system/scx_lnl.service`:
+
+```ini
+[Unit]
+Description=sched_ext scheduler (scx_lnl)
+ConditionPathExists=/sys/kernel/sched_ext
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/scx_lnl
+Restart=on-failure
+RestartSec=1
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+```
+
+2) Enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now scx_lnl.service
+```
+
+3) Verify:
+
+```bash
+systemctl status scx_lnl.service
+cat /sys/kernel/sched_ext/root/ops
+```
 
 ## Defaults / Key Knobs
 
