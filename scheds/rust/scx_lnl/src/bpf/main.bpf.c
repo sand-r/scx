@@ -35,6 +35,26 @@ static inline u64 tick_interval_ns(void)
 #define CPUFREQ_LOW_THRESH	(SCX_CPUPERF_ONE / 4)
 #define CPUFREQ_HIGH_THRESH	(SCX_CPUPERF_ONE - SCX_CPUPERF_ONE / 4)
 
+/*
+ * Quantization step for dynamic cpuperf requests.
+ *
+ * cpuperf requests are a 0..SCX_CPUPERF_ONE "percent-like" scale and don't need
+ * to be updated at full resolution. Coarsening the dynamic requests reduces
+ * cpuperf_set() churn (and thus idle overhead) without affecting interactive
+ * boosts (which are forced and not quantized).
+ */
+#define CPUFREQ_STEP_LVL	((SCX_CPUPERF_ONE / 64) ? (SCX_CPUPERF_ONE / 64) : 1)
+
+/*
+ * Minimum delay before lowering cpuperf requests (to avoid down/up oscillations
+ * on bursty workloads).
+ *
+ * This is most relevant in balanced profiles where background daemons may wake
+ * frequently and trigger short cpuperf spikes; delaying down transitions helps
+ * reduce cpuperf_set() churn.
+ */
+#define CPUFREQ_DECR_MIN_NS	(5ULL * NSEC_PER_MSEC)
+
 const volatile u64 __COMPAT_SCX_PICK_IDLE_IN_NODE;
 
 char _license[] SEC("license") = "GPL";
@@ -409,6 +429,8 @@ struct cpu_ctx {
 	u64 prev_runtime;
 	u64 last_running;
 	u64 perf_lvl;
+	u64 cpuperf_req;
+	u64 cpuperf_last_set;
 	struct bpf_cpumask __kptr *smt_cpumask;
 	struct bpf_cpumask __kptr *l2_cpumask;
 	struct bpf_cpumask __kptr *l3_cpumask;
@@ -466,6 +488,7 @@ struct task_ctx {
 	 * Keep track of the last waker.
 	 */
 	u32 waker_pid;
+	bool waker_is_kthread;
 };
 
 /* Map that contains task-local storage. */
@@ -491,6 +514,38 @@ struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 static inline bool is_kthread(const struct task_struct *p)
 {
 	return p->flags & PF_KTHREAD;
+}
+
+static inline bool cpuperf_set(s32 cpu, struct cpu_ctx *cctx, u64 perf_lvl, bool force)
+{
+	u64 now;
+
+	if (!cctx)
+		return false;
+
+	if (!force) {
+		perf_lvl = (perf_lvl + CPUFREQ_STEP_LVL / 2) / CPUFREQ_STEP_LVL * CPUFREQ_STEP_LVL;
+		perf_lvl = MIN(perf_lvl, SCX_CPUPERF_ONE);
+	}
+
+	if (perf_lvl == cctx->cpuperf_req)
+		return false;
+
+	now = scx_bpf_now();
+
+	/*
+	 * Allow immediate up transitions, but rate-limit down transitions unless
+	 * explicitly forced (e.g. CPU going idle).
+	 */
+	if (!force &&
+	    perf_lvl < cctx->cpuperf_req &&
+	    time_delta(now, cctx->cpuperf_last_set) < CPUFREQ_DECR_MIN_NS)
+		return false;
+
+	scx_bpf_cpuperf_set(cpu, perf_lvl);
+	cctx->cpuperf_req = perf_lvl;
+	cctx->cpuperf_last_set = now;
+	return true;
 }
 
 static inline bool is_interactive(const struct task_struct *p, const struct task_ctx *tctx)
@@ -1771,8 +1826,8 @@ void BPF_STRUCT_OPS(ext_dispatch, s32 cpu, struct task_struct *prev)
 				return;
 		}
 
-		scx_bpf_cpuperf_set(cpu, 0);
-		__sync_fetch_and_add(&nr_cpuperf_idle_drops, 1);
+		if (cpuperf_set(cpu, try_lookup_cpu_ctx(cpu), 0, true))
+			__sync_fetch_and_add(&nr_cpuperf_idle_drops, 1);
 	}
 }
 
@@ -1843,7 +1898,7 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	/*
 	 * Use a moving average to evaluate the target performance level,
 	 * giving more priority to the current average, so that we can
-		 * react faster at CPU load variations and at the same time smooth
+	 * react faster at CPU load variations and at the same time smooth
 	 * the short spikes.
 	 */
 	cctx->perf_lvl = calc_avg(perf_lvl, cctx->perf_lvl);
@@ -1856,18 +1911,20 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 *  - if it's below the low threshold, scale down to half capacity;
 	 *  - otherwise, maintain the smoothed perf level.
 	 */
-		if (cpufreq_perf_lvl == -1) {
-			if (cctx->perf_lvl >= CPUFREQ_HIGH_THRESH)
-				perf_lvl = SCX_CPUPERF_ONE;
-			else if (cctx->perf_lvl <= CPUFREQ_LOW_THRESH)
-				perf_lvl = aggressive_cpuperf ? (SCX_CPUPERF_ONE / 2) : 0;
-			else
-				perf_lvl = cctx->perf_lvl;
+	if (cpufreq_perf_lvl == -1) {
+		if (cctx->perf_lvl >= CPUFREQ_HIGH_THRESH)
+			perf_lvl = SCX_CPUPERF_ONE;
+		else if (cctx->perf_lvl <= CPUFREQ_LOW_THRESH)
+			perf_lvl = aggressive_cpuperf ? (SCX_CPUPERF_ONE / 2) : 0;
+		else
+			perf_lvl = cctx->perf_lvl;
+
+		if (cpuperf_set(cpu, cctx, perf_lvl, false)) {
 			if (perf_lvl == SCX_CPUPERF_ONE)
 				__sync_fetch_and_add(&nr_cpuperf_max_reqs, 1);
-			scx_bpf_cpuperf_set(cpu, perf_lvl);
 			__sync_fetch_and_add(&nr_cpuperf_updates, 1);
 		}
+	}
 
 	cctx->last_running = now;
 	cctx->prev_runtime = cctx->tot_runtime;
@@ -1895,6 +1952,7 @@ void BPF_STRUCT_OPS(ext_running, struct task_struct *p)
 	 */
 	if (cpufreq_perf_lvl == -1 &&
 	    is_interactive(p, tctx) &&
+	    !tctx->waker_is_kthread &&
 	    time_delta(now, tctx->last_wake_at) <= interactive_boost_ns) {
 		s32 cpu = scx_bpf_task_cpu(p);
 		struct cpu_ctx *cctx;
@@ -1914,14 +1972,14 @@ void BPF_STRUCT_OPS(ext_running, struct task_struct *p)
 					cpuperf_lvl = cctx->perf_lvl;
 			}
 
-				if (boost_lvl > cpuperf_lvl) {
-					if (boost_lvl == SCX_CPUPERF_ONE)
-						__sync_fetch_and_add(&nr_cpuperf_max_boosts, 1);
-					scx_bpf_cpuperf_set(cpu, boost_lvl);
-					__sync_fetch_and_add(&nr_interactive_boosts, 1);
-				}
+			if (boost_lvl > cpuperf_lvl &&
+			    cpuperf_set(cpu, cctx, boost_lvl, true)) {
+				if (boost_lvl == SCX_CPUPERF_ONE)
+					__sync_fetch_and_add(&nr_cpuperf_max_boosts, 1);
+				__sync_fetch_and_add(&nr_interactive_boosts, 1);
 			}
 		}
+	}
 
 	/*
 	 * Update the global vruntime as a new task is starting to use a
@@ -1991,6 +2049,7 @@ void BPF_STRUCT_OPS(ext_runnable, struct task_struct *p, u64 enq_flags)
 
 	tctx->exec_runtime = 0;
 	tctx->waker_pid = current->pid;
+	tctx->waker_is_kthread = is_kthread(current);
 	tctx->last_wake_at = now;
 }
 
@@ -2238,6 +2297,7 @@ static void init_cpuperf_target(void)
 	const struct cpumask *online_cpumask;
 	struct node_ctx *nctx;
 	u64 perf_lvl;
+	u64 now = scx_bpf_now();
 	int node;
 	s32 cpu;
 
@@ -2253,11 +2313,27 @@ static void init_cpuperf_target(void)
 		 * request before we collect any load signals).
 		 */
 		if (cpufreq_perf_lvl == -1) {
+			struct cpu_ctx *cctx;
+
 			perf_lvl = aggressive_cpuperf ? (SCX_CPUPERF_ONE / 2) : 0;
 			scx_bpf_cpuperf_set(cpu, perf_lvl);
+
+			cctx = try_lookup_cpu_ctx(cpu);
+			if (cctx) {
+				cctx->cpuperf_req = perf_lvl;
+				cctx->cpuperf_last_set = now;
+			}
 		} else if (cpufreq_perf_lvl >= 0) {
+			struct cpu_ctx *cctx;
+
 			perf_lvl = MIN(cpufreq_perf_lvl, SCX_CPUPERF_ONE);
 			scx_bpf_cpuperf_set(cpu, perf_lvl);
+
+			cctx = try_lookup_cpu_ctx(cpu);
+			if (cctx) {
+				cctx->cpuperf_req = perf_lvl;
+				cctx->cpuperf_last_set = now;
+			}
 		}
 
 		/* Evaluate the amount of online CPUs for each node */
