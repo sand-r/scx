@@ -67,7 +67,8 @@ space) to rank idle CPUs and prefer the most energy-efficient CPU within the can
 
 Enable with:
 
-- `--energy-aware`: use energy-model-based idle CPU ranking (experimental).
+- Enabled by default.
+- `--no-energy-aware`: disable energy-model-based idle CPU ranking.
 
 ## Kernel Kconfig (`__kconfig` externs)
 
@@ -183,8 +184,7 @@ The most relevant defaults for CPU placement and responsiveness:
   positives on some kernels (set to `0` to disable).
 - `--cpu-busy-thresh -1`: dynamic busy threshold (derived from global user CPU time) used to decide
   when a CPU is "busy" and should overflow more aggressively.
-- `--energy-aware`: optionally rank idle CPUs using energy model inputs (experimental; forces custom
-  CPU selection).
+- Energy-aware idle CPU selection: enabled by default (disable with `--no-energy-aware`).
 
 In non-performance power profiles, `scx_lnl` tries hard to keep work on the primary domain (typically
 E-cores) and uses the perf domain (typically P-cores) as an escape hatch for interactive bursts when
