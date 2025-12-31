@@ -8,6 +8,7 @@
 #define MAX_VTIME	(~0ULL)
 
 #define DSQ_FLAG_NODE	(1LLU << 32)
+#define DSQ_FLAG_NODE_OVERFLOW	(2LLU << 32)
 extern unsigned CONFIG_HZ __kconfig;
 
 /*
@@ -681,6 +682,16 @@ static inline u64 node_to_dsq(int node)
 }
 
 /*
+ * Return the overflow DSQ associated to @node.
+ *
+ * Tasks enqueued here are allowed to spill into non-primary CPUs.
+ */
+static inline u64 node_to_dsq_overflow(int node)
+{
+	return DSQ_FLAG_NODE_OVERFLOW | node;
+}
+
+/*
  * Return the total amount of tasks that are currently waiting to be scheduled.
  */
 static inline u64 nr_tasks_waiting(s32 cpu)
@@ -689,7 +700,8 @@ static inline u64 nr_tasks_waiting(s32 cpu)
 
 	return scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) +
 	       scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
-	       scx_bpf_dsq_nr_queued(node_to_dsq(node));
+	       scx_bpf_dsq_nr_queued(node_to_dsq(node)) +
+	       scx_bpf_dsq_nr_queued(node_to_dsq_overflow(node));
 }
 
 /*
@@ -1380,12 +1392,19 @@ static bool kick_idle_cpu(const struct task_struct *p, const struct task_ctx *tc
 			  s32 prev_cpu, bool idle_smt)
 {
 	const struct cpumask *mask;
+	const struct cpumask *primary;
 	u64 flags = idle_smt ? SCX_PICK_IDLE_CORE : 0;
 	s32 cpu = scx_bpf_task_cpu(p);
 	int node = __COMPAT_scx_bpf_cpu_node(cpu);
+	bool has_primary;
+	bool prev_in_primary;
 
 	if (is_throttled())
 		return false;
+
+	primary = cast_mask(primary_cpumask);
+	has_primary = primary && bpf_cpumask_intersects(primary, p->cpus_ptr);
+	prev_in_primary = primary_all || (primary && bpf_cpumask_test_cpu(prev_cpu, primary));
 
 	/*
 	 * No need to look for full-idle SMT cores if SMT is disabled.
@@ -1396,7 +1415,7 @@ static bool kick_idle_cpu(const struct task_struct *p, const struct task_ctx *tc
 	/*
 	 * Try to reuse the same CPU if idle.
 	 */
-	if (!idle_smt || is_fully_idle(prev_cpu)) {
+	if ((!idle_smt || is_fully_idle(prev_cpu)) && (!has_primary || prev_in_primary)) {
 		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 			return true;
@@ -1637,9 +1656,13 @@ static void rr_enqueue(struct task_struct *p, struct task_ctx *tctx,
 void BPF_STRUCT_OPS(ext_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	const struct cpumask *idle_cpumask;
+	const struct cpumask *primary;
 	struct task_ctx *tctx;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 	int node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
+	bool has_primary;
+	bool prev_in_primary;
+	u64 node_dsq;
 
 	/*
 	 * Dispatch regular tasks to the shared DSQ.
@@ -1675,7 +1698,12 @@ void BPF_STRUCT_OPS(ext_enqueue, struct task_struct *p, u64 enq_flags)
 	 * and use the per-node DSQ if the CPU is getting saturated, so
 	 * that tasks can attempt to migrate somewhere else.
 	 */
-	if (!scx_bpf_task_running(p) && can_enqueue_to_cpu(p, prev_cpu)) {
+	primary = cast_mask(primary_cpumask);
+	has_primary = primary && bpf_cpumask_intersects(primary, p->cpus_ptr);
+	prev_in_primary = primary_all || (primary && bpf_cpumask_test_cpu(prev_cpu, primary));
+
+	if (!scx_bpf_task_running(p) && (!has_primary || prev_in_primary) &&
+	    can_enqueue_to_cpu(p, prev_cpu)) {
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
 					 task_slice(p, prev_cpu), p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_shared_dispatches, 1);
@@ -1683,7 +1711,19 @@ void BPF_STRUCT_OPS(ext_enqueue, struct task_struct *p, u64 enq_flags)
 
 		return;
 	}
-	scx_bpf_dsq_insert_vtime(p, node_to_dsq(node),
+
+	/*
+	 * Tasks that can't run on the primary domain must be allowed to spill to
+	 * non-primary CPUs. Tasks that can use the primary domain should only
+	 * spill when the current CPU is busy (or when aggressive overflow is
+	 * enabled via the power profile).
+	 */
+	node_dsq = node_to_dsq(node);
+	if (!has_primary || (has_primary && !primary_all &&
+			     (aggressive_overflow || is_cpu_busy(prev_cpu))))
+		node_dsq = node_to_dsq_overflow(node);
+
+	scx_bpf_dsq_insert_vtime(p, node_dsq,
 				 task_slice(p, prev_cpu), p->scx.dsq_vtime, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
@@ -1804,6 +1844,9 @@ static bool keep_running(const struct task_struct *p, s32 cpu)
 void BPF_STRUCT_OPS(ext_dispatch, s32 cpu, struct task_struct *prev)
 {
 	int node = __COMPAT_scx_bpf_cpu_node(cpu);
+	const struct cpumask *primary = cast_mask(primary_cpumask);
+	bool cpu_in_primary = primary_all ||
+			      (primary && bpf_cpumask_test_cpu(cpu, primary));
 
 	/*
 	 * Let the CPU go idle if the system is throttled.
@@ -1818,9 +1861,21 @@ void BPF_STRUCT_OPS(ext_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Try to consume a task from the per-node DSQ.
+	 * Try to consume a task from the per-node primary DSQ.
+	 *
+	 * Only CPUs in the primary domain should consume from this DSQ, so we
+	 * don't wake up non-primary CPUs when the primary domain still has
+	 * capacity.
 	 */
-	if (scx_bpf_dsq_move_to_local(node_to_dsq(node)))
+	if (cpu_in_primary) {
+		if (scx_bpf_dsq_move_to_local(node_to_dsq(node)))
+			return;
+	}
+
+	/*
+	 * Try to consume a task from the per-node overflow DSQ.
+	 */
+	if (scx_bpf_dsq_move_to_local(node_to_dsq_overflow(node)))
 		return;
 
 	/*
@@ -2615,6 +2670,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ext_init)
 		err = scx_bpf_create_dsq(node_to_dsq(node), node);
 		if (err) {
 			scx_bpf_error("failed to create DSQ %d: %d", node, err);
+			return err;
+		}
+
+		err = scx_bpf_create_dsq(node_to_dsq_overflow(node), node);
+		if (err) {
+			scx_bpf_error("failed to create overflow DSQ %d: %d", node, err);
 			return err;
 		}
 	}
