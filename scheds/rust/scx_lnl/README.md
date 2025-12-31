@@ -21,6 +21,8 @@ The design is based on `scx_flash` (EDF with latency weighting), but adds:
   hybrid CPU this is typically set to the efficiency cores in balanced mode.
 - **Perf domain** (`--perf-domain`): preferred CPUs for interactive bursts. On hybrid systems this
   is typically the performance cores.
+- **Overflow**: tasks which can't run on the primary domain (or tasks spilling due to load) are
+  queued separately so non-primary CPUs don't wake up unless overflow is needed.
 
 In `--primary-domain auto` mode, `scx_lnl` updates the primary domain and a few profile-driven
 knobs when the system power profile changes (e.g. balanced → performance).
