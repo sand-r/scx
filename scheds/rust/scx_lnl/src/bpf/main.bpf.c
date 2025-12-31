@@ -2588,26 +2588,24 @@ static void init_cpuperf_target(void)
  */
 static s32 watchdog_kick_cpu(void)
 {
-	const struct cpumask *primary = cast_mask(primary_cpumask);
-	const struct cpumask *online;
-	s32 cpu, pick = 0;
+	const struct cpumask *primary, *online;
+	u32 pick;
 
-	if (!primary)
+	bpf_rcu_read_lock();
+	primary = cast_mask(primary_cpumask);
+	if (!primary) {
+		bpf_rcu_read_unlock();
 		return 0;
-
-	online = scx_bpf_get_online_cpumask();
-
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (!bpf_cpumask_test_cpu(cpu, online))
-			continue;
-		if (bpf_cpumask_test_cpu(cpu, primary)) {
-			pick = cpu;
-			break;
-		}
 	}
 
+	online = scx_bpf_get_online_cpumask();
+	pick = bpf_cpumask_any_and_distribute(primary, online);
+	if (pick >= nr_cpu_ids)
+		pick = bpf_cpumask_any_distribute(online);
 	scx_bpf_put_cpumask(online);
-	return pick;
+
+	bpf_rcu_read_unlock();
+	return pick < nr_cpu_ids ? (s32)pick : 0;
 }
 
 /*
