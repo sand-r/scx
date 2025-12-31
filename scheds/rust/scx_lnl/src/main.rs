@@ -235,6 +235,13 @@ struct Opts {
     #[clap(short = 'T', long, action = clap::ArgAction::SetTrue)]
     tickless: bool,
 
+    /// Kick an idle CPU periodically to avoid sched_ext watchdog false positives (0 = disable).
+    ///
+    /// Some kernels may incorrectly treat long idle periods as a runnable stall and automatically
+    /// disable the scheduler.
+    #[clap(long, default_value = "2000")]
+    watchdog_kick_ms: u64,
+
     /// Enable round-robin scheduling.
     ///
     /// Each task is given a fixed time slice (defined by --slice-us) and run in a cyclic, fair
@@ -582,6 +589,7 @@ impl<'a> Scheduler<'a> {
         rodata.sticky_cpu = opts.sticky_cpu;
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.tickless_sched = opts.tickless;
+        rodata.watchdog_kick_ns = opts.watchdog_kick_ms * 1_000_000;
         rodata.native_priority = opts.native_priority;
         rodata.slice_lag_scaling = opts.slice_lag_scaling;
         rodata.builtin_idle = !opts.no_builtin_idle;

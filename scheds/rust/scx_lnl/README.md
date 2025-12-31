@@ -168,6 +168,8 @@ The most relevant defaults for CPU placement and responsiveness:
 - `--interactive-boost-ms 20`: wakeup boost window for interactive tasks.
 - `--interactive-boost-lvl 512`: cpuperf floor during interactive boosts (when cpuperf control is
   enabled).
+- `--watchdog-kick-ms 2000`: periodically kicks an idle CPU to avoid sched_ext watchdog false
+  positives on some kernels (set to `0` to disable).
 - `--cpu-busy-thresh -1`: dynamic busy threshold (derived from global user CPU time) used to decide
   when a CPU is "busy" and should overflow more aggressively.
 

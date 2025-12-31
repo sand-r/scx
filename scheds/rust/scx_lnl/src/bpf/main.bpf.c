@@ -236,6 +236,14 @@ const volatile bool native_priority;
 const volatile bool tickless_sched;
 
 /*
+ * Kick an idle CPU periodically to keep the sched_ext watchdog happy (0 = disable).
+ *
+ * Some kernels may falsely treat long idle periods as a runnable stall and
+ * automatically disable the scheduler.
+ */
+const volatile u64 watchdog_kick_ns;
+
+/*
  * The CPU frequency performance level: a negative value will not affect the
  * performance level and will be ignored.
  */
@@ -374,6 +382,20 @@ struct {
 	__type(key, u32);
 	__type(value, struct tickless_timer);
 } tickless_timer SEC(".maps");
+
+/*
+ * Watchdog timer used to keep sched_ext alive across long idle periods.
+ */
+struct watchdog_timer {
+	struct bpf_timer timer;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct watchdog_timer);
+} watchdog_timer SEC(".maps");
 
 /*
  * Per-node context.
@@ -2346,6 +2368,52 @@ static void init_cpuperf_target(void)
 }
 
 /*
+ * Pick the CPU to kick for keeping the sched_ext watchdog alive.
+ *
+ * Prefer a CPU in the primary domain (typically E-cores in balanced mode).
+ */
+static s32 watchdog_kick_cpu(void)
+{
+	const struct cpumask *primary = cast_mask(primary_cpumask);
+	const struct cpumask *online;
+	s32 cpu, pick = 0;
+
+	if (!primary)
+		return 0;
+
+	online = scx_bpf_get_online_cpumask();
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (!bpf_cpumask_test_cpu(cpu, online))
+			continue;
+		if (bpf_cpumask_test_cpu(cpu, primary)) {
+			pick = cpu;
+			break;
+		}
+	}
+
+	scx_bpf_put_cpumask(online);
+	return pick;
+}
+
+/*
+ * Watchdog timer used to keep sched_ext alive across long idle periods.
+ */
+static int watchdog_timerfn(void *map, int *key, struct bpf_timer *timer)
+{
+	int err;
+
+	if (watchdog_kick_ns && !nr_running)
+		scx_bpf_kick_cpu(watchdog_kick_cpu(), SCX_KICK_IDLE);
+
+	err = bpf_timer_start(timer, watchdog_kick_ns, 0);
+	if (err)
+		scx_bpf_error("Failed to re-arm watchdog timer");
+
+	return 0;
+}
+
+/*
  * Tickless timer used to preempt CPUs.
  */
 static int tickless_timerfn(void *map, int *key, struct bpf_timer *timer)
@@ -2589,19 +2657,38 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ext_init)
 	/*
 	 * Fire the throttle timer if CPU throttling is enabled.
 	 */
-	if (throttle_ns) {
-		bpf_timer_init(timer, &throttle_timer, CLOCK_MONOTONIC);
-		bpf_timer_set_callback(timer, throttle_timerfn);
-		err = bpf_timer_start(timer, slice_max, 0);
-		if (err) {
-			scx_bpf_error("Failed to arm throttle timer");
-			return err;
+		if (throttle_ns) {
+			bpf_timer_init(timer, &throttle_timer, CLOCK_MONOTONIC);
+			bpf_timer_set_callback(timer, throttle_timerfn);
+			err = bpf_timer_start(timer, slice_max, 0);
+			if (err) {
+				scx_bpf_error("Failed to arm throttle timer");
+				return err;
+			}
 		}
-	}
 
-	/* Do not update NUMA statistics if there's only one node */
-	if (numa_disabled || __COMPAT_scx_bpf_nr_node_ids() <= 1)
-		return 0;
+		timer = bpf_map_lookup_elem(&watchdog_timer, &key);
+		if (!timer) {
+			scx_bpf_error("Failed to lookup watchdog timer");
+			return -ESRCH;
+		}
+
+		/*
+		 * Fire the watchdog timer if enabled.
+		 */
+		if (watchdog_kick_ns) {
+			bpf_timer_init(timer, &watchdog_timer, CLOCK_MONOTONIC);
+			bpf_timer_set_callback(timer, watchdog_timerfn);
+			err = bpf_timer_start(timer, watchdog_kick_ns, 0);
+			if (err) {
+				scx_bpf_error("Failed to arm watchdog timer");
+				return err;
+			}
+		}
+
+		/* Do not update NUMA statistics if there's only one node */
+		if (numa_disabled || __COMPAT_scx_bpf_nr_node_ids() <= 1)
+			return 0;
 
 	timer = bpf_map_lookup_elem(&numa_timer, &key);
 	if (!timer) {
