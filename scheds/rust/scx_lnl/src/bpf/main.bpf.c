@@ -9,8 +9,6 @@
 
 #define DSQ_FLAG_NODE	(1LLU << 32)
 
-extern unsigned CONFIG_HZ __kconfig;
-
 /*
  * When running in performance profile, keep cpuperf requests for a short window
  * after a CPU goes idle to avoid frequency down/up oscillations on bursty,
@@ -19,11 +17,18 @@ extern unsigned CONFIG_HZ __kconfig;
 #define PERF_IDLE_RETAIN_NS	(20ULL * NSEC_PER_MSEC)
 
 /*
- * Return the time interval between two ticks in ns.
+ * Return the time interval used for re-arming the tickless preemption timer.
+ *
+ * Some scx schedulers use CONFIG_HZ (__kconfig extern) for this interval.
+ * However, resolving __kconfig externs requires a readable kernel config (e.g.
+ * /proc/config.gz or /boot/config-$(uname -r)). Some distros / custom kernels
+ * don't ship those, which would prevent loading the scheduler.
+ *
+ * Use a fixed 4ms interval (~250Hz) to avoid depending on kernel Kconfig.
  */
 static inline u64 tick_interval_ns(void)
 {
-	return NSEC_PER_SEC / CONFIG_HZ;
+	return 4ULL * NSEC_PER_MSEC;
 }
 
 /*
