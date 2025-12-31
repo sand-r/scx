@@ -75,13 +75,12 @@ domain to enable peak boost when needed.
 
 ## Energy Model (CPU Selection)
 
-`scx_lnl` can optionally use the kernel energy model (as exported via sysfs and ingested by user
-space) to rank idle CPUs and prefer the most energy-efficient CPU within the candidate set.
+By default, `scx_lnl` uses the kernel energy model (as exported via sysfs and ingested by user
+space) to rank idle CPU candidates and prefer the most energy-efficient option.
 
-Enable with:
+Disable with:
 
-- Enabled by default.
-- `--no-energy-aware`: disable energy-model-based idle CPU ranking.
+- `--no-energy-aware`
 
 ## Kernel Kconfig (`__kconfig` externs)
 
