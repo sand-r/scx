@@ -15,6 +15,16 @@ The design is based on `scx_flash` (EDF with latency weighting), but adds:
 - Optional CPU frequency hinting via `scx_bpf_cpuperf_set()` (intended for `schedutil`).
 - Power-profile tracking to adapt behavior at runtime (no reload required).
 
+## Recommended Setup
+
+For Lunar Lake (and similar Intel hybrid laptops), the recommended configuration is:
+
+- `intel_pstate=active` + `powersave` governor (HWP / hardware-managed frequency selection)
+- `scx_lnl` with defaults (no flags)
+
+In this setup, `scx_lnl` focuses on **task placement and latency/throughput policy**, while the
+hardware handles frequency selection.
+
 ## Concepts
 
 - **Primary domain** (`--primary-domain`): the default set of CPUs used for dispatching. With a
@@ -46,6 +56,9 @@ When `--primary-domain auto` is used:
 `scx_lnl` can drive `scx_bpf_cpuperf_set()` requests based on observed CPU load and interactive
 wakeups. This is intended for use with the `schedutil` governor (e.g. `intel_pstate=passive` with
 `intel_cpufreq` on Intel systems).
+
+This path is **experimental** and not recommended unless you're explicitly running `schedutil` and
+want to iterate on cpuperf hinting behavior.
 
 By default, cpuperf control is auto-enabled when `scx_lnl` detects:
 
@@ -119,6 +132,8 @@ Notes:
 
 - Defaults are equivalent to `--primary-domain auto --perf-domain performance` and `cpufreq` set to
   auto.
+- Recommended kernel setup is `intel_pstate=active` + `powersave` governor. `intel_pstate=passive`
+  + `schedutil` is supported but cpuperf hinting is experimental.
 - If you set `--primary-domain` to a fixed domain (not `auto`), `scx_lnl` will not change domains or
   profile-driven knobs when the system profile changes.
 - For the full list of options, run `./target/release/scx_lnl --help`.
@@ -132,7 +147,8 @@ sudo ./target/release/scx_lnl --stats 1
 ```
 
 `cpuperf -> max:` reports how often the scheduler requested max cpuperf from load tracking during
-the last interval.
+the last interval. When cpuperf control is disabled (e.g. `intel_pstate=active`), cpuperf counters
+will stay at `0`.
 
 ### Autostart After Boot (systemd)
 
