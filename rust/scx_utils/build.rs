@@ -4,12 +4,87 @@
 // GNU General Public License version 2.
 
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use scx_cargo::ClangInfo;
 use vergen::EmitBuilder;
+
+fn find_dot_git(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let dot_git = dir.join(".git");
+        if dot_git.exists() {
+            return Some(dot_git);
+        }
+    }
+    None
+}
+
+fn get_git_dirs(manifest_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot_git = find_dot_git(manifest_dir)?;
+
+    if dot_git.is_dir() {
+        return Some((dot_git.clone(), dot_git));
+    }
+
+    if !dot_git.is_file() {
+        return None;
+    }
+
+    let dot_git_content = fs::read_to_string(&dot_git).ok()?;
+    let git_dir_spec = dot_git_content.trim().strip_prefix("gitdir:")?.trim();
+    let mut git_dir = PathBuf::from(git_dir_spec);
+    if git_dir.is_relative() {
+        git_dir = dot_git.parent()?.join(git_dir);
+    }
+
+    // In git worktrees, git_dir points to a worktree-specific directory which
+    // may contain a 'commondir' file that points at the shared git dir
+    // containing refs/packed-refs.
+    let common_dir = if let Ok(common_dir_spec) = fs::read_to_string(git_dir.join("commondir")) {
+        let mut common_dir = PathBuf::from(common_dir_spec.trim());
+        if common_dir.is_relative() {
+            common_dir = git_dir.join(common_dir);
+        }
+        common_dir
+    } else {
+        git_dir.clone()
+    };
+
+    Some((git_dir, common_dir))
+}
+
+fn emit_git_rerun_triggers() {
+    let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let Some((git_dir, common_dir)) = get_git_dirs(Path::new(&manifest_dir)) else {
+        return;
+    };
+
+    // Always rerun when the checked-out commit changes.
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+
+    // Dirty state changes may update the index (e.g. staging changes).
+    println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
+
+    // Some repos store refs in packed-refs rather than loose ref files.
+    println!(
+        "cargo:rerun-if-changed={}",
+        common_dir.join("packed-refs").display()
+    );
+
+    // If HEAD points to a ref, watch the corresponding ref file too.
+    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
+        if let Some(ref_path) = head.trim().strip_prefix("ref: ") {
+            println!(
+                "cargo:rerun-if-changed={}",
+                common_dir.join(ref_path.trim()).display()
+            );
+        }
+    }
+}
 
 fn gen_bindings() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -63,6 +138,7 @@ fn gen_bindings() {
 }
 
 fn main() {
+    emit_git_rerun_triggers();
     gen_bindings();
 
     EmitBuilder::builder()
