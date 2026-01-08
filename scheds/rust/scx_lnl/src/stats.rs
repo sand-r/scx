@@ -31,6 +31,10 @@ pub struct Metrics {
     pub nr_idle_perf_picks: u64,
     #[stat(desc = "Number of built-in idle CPU picks without domain preference")]
     pub nr_idle_any_picks: u64,
+    #[stat(desc = "Number of energy-aware idle CPU picks")]
+    pub nr_idle_em_picks: u64,
+    #[stat(desc = "Number of energy-aware picks that stayed on the previous CPU")]
+    pub nr_idle_em_prev_picks: u64,
     #[stat(desc = "Number of cpuperf updates from load tracking")]
     pub nr_cpuperf_updates: u64,
     #[stat(desc = "Number of cpuperf drops on idle CPUs")]
@@ -47,7 +51,7 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5} max: {:<5} | idle_pick -> pri: {:<5} perf: {:<5} any: {:<5}",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | cpuperf -> up: {:<5} drop: {:<5} boost: {:<5} max: {:<5} | idle_pick -> pri: {:<5} perf: {:<5} any: {:<5} | em_pick -> tot: {:<5} prev: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
@@ -61,6 +65,8 @@ impl Metrics {
             self.nr_idle_primary_picks,
             self.nr_idle_perf_picks,
             self.nr_idle_any_picks,
+            self.nr_idle_em_picks,
+            self.nr_idle_em_prev_picks,
         )?;
         Ok(())
     }
@@ -73,6 +79,8 @@ impl Metrics {
             nr_idle_primary_picks: self.nr_idle_primary_picks - rhs.nr_idle_primary_picks,
             nr_idle_perf_picks: self.nr_idle_perf_picks - rhs.nr_idle_perf_picks,
             nr_idle_any_picks: self.nr_idle_any_picks - rhs.nr_idle_any_picks,
+            nr_idle_em_picks: self.nr_idle_em_picks - rhs.nr_idle_em_picks,
+            nr_idle_em_prev_picks: self.nr_idle_em_prev_picks - rhs.nr_idle_em_prev_picks,
             nr_cpuperf_updates: self.nr_cpuperf_updates - rhs.nr_cpuperf_updates,
             nr_cpuperf_idle_drops: self.nr_cpuperf_idle_drops - rhs.nr_cpuperf_idle_drops,
             nr_interactive_boosts: self.nr_interactive_boosts - rhs.nr_interactive_boosts,

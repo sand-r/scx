@@ -268,6 +268,7 @@ volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
  * Policy statistics.
  */
 volatile u64 nr_idle_primary_picks, nr_idle_perf_picks, nr_idle_any_picks;
+volatile u64 nr_idle_em_picks, nr_idle_em_prev_picks;
 
 /*
  * CPU performance hint statistics.
@@ -748,6 +749,10 @@ static s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int nod
 
 	if (!scx_bpf_test_and_clear_cpu_idle(best_cpu))
 		return -ENOENT;
+
+	__sync_fetch_and_add(&nr_idle_em_picks, 1);
+	if (best_cpu == prev_cpu)
+		__sync_fetch_and_add(&nr_idle_em_prev_picks, 1);
 
 	return best_cpu;
 }
@@ -2584,28 +2589,54 @@ static void init_cpuperf_target(void)
 /*
  * Pick the CPU to kick for keeping the sched_ext watchdog alive.
  *
- * Prefer a CPU in the primary domain (typically E-cores in balanced mode).
+ * Prefer a non-big CPU when possible (typically E-cores in balanced mode).
  */
 static s32 watchdog_kick_cpu(void)
 {
-	const struct cpumask *primary, *online;
-	u32 pick;
-
-	bpf_rcu_read_lock();
-	primary = cast_mask(primary_cpumask);
-	if (!primary) {
-		bpf_rcu_read_unlock();
-		return 0;
-	}
+	const struct cpumask *online;
+	u32 pick, start;
+	s32 cpu;
 
 	online = scx_bpf_get_online_cpumask();
-	pick = bpf_cpumask_any_and_distribute(primary, online);
-	if (pick >= nr_cpu_ids)
-		pick = bpf_cpumask_any_distribute(online);
-	scx_bpf_put_cpumask(online);
+	if (!online)
+		return 0;
 
-	bpf_rcu_read_unlock();
-	return pick < nr_cpu_ids ? (s32)pick : 0;
+	/*
+	 * Try to kick a non-big CPU first to avoid waking up perf cores on
+	 * mostly-idle systems. Distribute kicks across CPUs to avoid keeping
+	 * a single core artificially hot.
+	 */
+	start = bpf_cpumask_any_distribute(online);
+	if (start >= NR_CPUS)
+		start = 0;
+
+	pick = NR_CPUS;
+	bpf_for(cpu, start, NR_CPUS) {
+		u32 ucpu = (u32)cpu & (NR_CPUS - 1);
+
+		if (!bpf_cpumask_test_cpu(ucpu, online))
+			continue;
+		if (!cpu_is_big[ucpu]) {
+			pick = ucpu;
+			goto out_put;
+		}
+	}
+	bpf_for(cpu, 0, start) {
+		u32 ucpu = (u32)cpu & (NR_CPUS - 1);
+
+		if (!bpf_cpumask_test_cpu(ucpu, online))
+			continue;
+		if (!cpu_is_big[ucpu]) {
+			pick = ucpu;
+			goto out_put;
+		}
+	}
+
+	pick = bpf_cpumask_any_distribute(online);
+
+out_put:
+	scx_bpf_put_cpumask(online);
+	return pick < NR_CPUS ? (s32)pick : 0;
 }
 
 /*

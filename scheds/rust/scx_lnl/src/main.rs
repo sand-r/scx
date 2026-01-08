@@ -463,6 +463,9 @@ impl<'a> Scheduler<'a> {
         let release = Self::kernel_release()?;
         let candidates = [
             format!("/boot/config-{}", release),
+            // Fedora (and some other distros) ship the kernel config here even without kernel-devel.
+            format!("/lib/modules/{}/config", release),
+            format!("/usr/lib/modules/{}/config", release),
             format!("/lib/modules/{}/build/.config", release),
             format!("/lib/modules/{}/build/include/config/auto.conf", release),
         ];
@@ -1111,6 +1114,8 @@ impl<'a> Scheduler<'a> {
             nr_idle_primary_picks: bss_data.nr_idle_primary_picks,
             nr_idle_perf_picks: bss_data.nr_idle_perf_picks,
             nr_idle_any_picks: bss_data.nr_idle_any_picks,
+            nr_idle_em_picks: bss_data.nr_idle_em_picks,
+            nr_idle_em_prev_picks: bss_data.nr_idle_em_prev_picks,
             nr_cpuperf_updates: bss_data.nr_cpuperf_updates,
             nr_cpuperf_idle_drops: bss_data.nr_cpuperf_idle_drops,
             nr_interactive_boosts: bss_data.nr_interactive_boosts,

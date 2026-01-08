@@ -90,6 +90,7 @@ If your kernel doesn't expose system Kconfig (e.g. missing `/proc/config.gz` and
 `/boot/config-$(uname -r)`), `scx_lnl` will try to auto-detect a config from:
 
 - `/boot/config-<release>`
+- `/lib/modules/<release>/config`
 - `/lib/modules/<release>/build/.config`
 - `/lib/modules/<release>/build/include/config/auto.conf`
 
