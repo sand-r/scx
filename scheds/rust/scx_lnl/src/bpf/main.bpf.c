@@ -2319,13 +2319,9 @@ void BPF_STRUCT_OPS(ext_quiescent, struct task_struct *p, u64 deq_flags)
 
 	/*
 	 * Refresh the average rate of voluntary context switches.
-	 *
-	 * Throttle updates to reduce overhead for high-frequency sleepers
-	 * (e.g., GPU-bound workloads). Only recalculate if at least 1ms
-	 * has passed since the last update.
 	 */
 	delta_t = time_delta(now, tctx->last_sleep_at);
-	if (delta_t >= NSEC_PER_MSEC) {
+	if (delta_t > 0) {
 		u64 nvcsw = slice_max / delta_t;
 
 		tctx->avg_nvcsw = calc_avg_clamp(tctx->avg_nvcsw, nvcsw, 0, max_avg_nvcsw);
