@@ -29,7 +29,7 @@ enum consts {
 	MAX_CPUS_U8		= MAX_CPUS / 8,
 	MAX_TASKS		= 131072,
 	MAX_PATH		= 4096,
-	MAX_NUMA_NODES		= 64,
+	MAX_NUMA_NODES		= 8,
 	MAX_LLCS		= 64,
 	MAX_COMM		= 16,
 	MAX_LAYER_MATCH_ORS	= 32,
@@ -42,6 +42,7 @@ enum consts {
 	DEFAULT_LAYER_WEIGHT	= 100,
 	USAGE_HALF_LIFE		= 100000000,	/* 100ms */
 	RUNTIME_DECAY_FACTOR	= 4,
+	DUTY_CYCLE_SHIFT	= 20,		/* duty_cycle 1.0 = 1 << 20 */
 	LAYER_LAT_DECAY_FACTOR	= 32,
 	CLEAR_PREEMPTING_AFTER	= 10000000,	/* 10ms */
 
@@ -51,7 +52,7 @@ enum consts {
 
 	DSQ_ID_LAYER_SHIFT	= 16,
 	DSQ_ID_LLC_MASK		= (1LLU << DSQ_ID_LAYER_SHIFT) - 1,		/* 0x0000ffff */
-	DSQ_ID_LAYER_MASK	= ~DSQ_ID_LAYER_SHIFT & ~DSQ_ID_SPECIAL_MASK,	/* 0x3fff0000 */
+	DSQ_ID_LAYER_MASK	= ~DSQ_ID_LLC_MASK & ~DSQ_ID_SPECIAL_MASK,	/* 0x3fff0000 */
 
 	/* XXX remove */
 	MAX_CGRP_PREFIXES	= 32,
@@ -193,9 +194,11 @@ struct cpu_ctx {
 	bool			is_protected;
 
 	u64			layer_usages[MAX_LAYERS][NR_LAYER_USAGES];
+	u64			node_pinned_usage[MAX_LAYERS];
 	u64			layer_membw_agg[MAX_LAYERS][NR_LAYER_USAGES];
 	u64			gstats[NR_GSTATS];
 	u64			lstats[MAX_LAYERS][NR_LSTATS];
+	u64			layer_duty_sum[MAX_LAYERS];
 	u64			ran_current_for;
 
 	u64			usage;
@@ -241,12 +244,30 @@ struct llc_ctx {
 	struct llc_prox_map	prox_map;
 };
 
+struct node_prox_map {
+	u16			nodes[MAX_NUMA_NODES];
+	u32			sys_end;
+};
+
 struct node_ctx {
 	u32			id;
 	struct bpf_cpumask __kptr *cpumask;
+	struct bpf_cpumask __kptr *unprotected_cpumask;
 	u32			nr_llcs;
 	u32			nr_cpus;
-	u64			llc_mask;
+	u32			llcs[MAX_LLCS];
+	u32			empty_layer_ids[MAX_LAYERS];
+	u32			nr_empty_layer_ids;
+	struct node_prox_map	prox_map;
+};
+
+struct refresh_node_ctx_arg {
+	u32			node_id;
+	u32			init;
+	u32			empty_layer_ids[MAX_LAYERS];
+	u32			nr_empty_layer_ids;
+	u32			llcs[MAX_LLCS];
+	u32			nr_llcs;
 };
 
 enum layer_match_kind {
@@ -338,6 +359,21 @@ enum layer_task_place {
 	PLACEMENT_FLOAT,
 };
 
+struct xnuma_bucket {
+	s64			tokens;
+	u64			last_refill_ts;
+	u64			rate;		/* duty_cycle units per second, set by userspace */
+};
+
+struct layer_node_ctx {
+	u32			nr_cpus;
+	u64			nr_pinned_tasks;
+	u64			llcs_to_drain;
+	u32			llc_drain_cnt;
+	bool			xnuma_is_mig_src;
+	struct xnuma_bucket xnuma[MAX_NUMA_NODES];
+};
+
 struct layer {
 	struct layer_match_ands	matches[MAX_LAYER_MATCH_ORS];
 	unsigned int		nr_match_ors;
@@ -356,7 +392,7 @@ struct layer {
 	bool			preempt;
 	bool			preempt_first;
 	bool			excl;
-	bool			allow_node_aligned;
+	bool			has_cpuset;
 	bool			skip_remote_node;
 	bool			prev_over_idle_core;
 	int			growth_algo;
@@ -364,8 +400,6 @@ struct layer {
 	u64			nr_tasks;
 
 	u64			cpus_seq;
-	u64			node_mask;
-	u64			llc_mask;
 	bool			check_no_idle;
 	u32			perf;
 	u64			refresh_cpus;
@@ -374,8 +408,8 @@ struct layer {
 	u32			nr_cpus;
 	u32			nr_llc_cpus[MAX_LLCS];
 
-	u64			llcs_to_drain;
-	u32			llc_drain_cnt;
+	struct layer_node_ctx	node[MAX_NUMA_NODES];
+
 	enum layer_task_place   task_place;
 
 	char			name[MAX_LAYER_NAME];

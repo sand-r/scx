@@ -6,6 +6,7 @@ mod bpf_skel;
 mod stats;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -46,6 +47,7 @@ use nvml_wrapper::Nvml;
 use once_cell::sync::OnceCell;
 use regex::Regex;
 use scx_bpf_compat;
+use scx_layered::alloc::{unified_alloc, LayerAlloc, LayerDemand};
 use scx_layered::*;
 use scx_raw_pmu::PMUManager;
 use scx_stats::prelude::*;
@@ -64,7 +66,6 @@ use scx_utils::uei_exited;
 use scx_utils::uei_report;
 use scx_utils::CoreType;
 use scx_utils::Cpumask;
-use scx_utils::Llc;
 use scx_utils::NetDev;
 use scx_utils::Topology;
 use scx_utils::TopologyArgs;
@@ -117,167 +118,52 @@ lazy_static! {
     static ref USAGE_DECAY: f64 = 0.5f64.powf(1.0 / USAGE_HALF_LIFE_F64);
     static ref DFL_DISALLOW_OPEN_AFTER_US: u64 = 2 * scx_enums.SCX_SLICE_DFL / 1000;
     static ref DFL_DISALLOW_PREEMPT_AFTER_US: u64 = 4 * scx_enums.SCX_SLICE_DFL / 1000;
-    static ref EXAMPLE_CONFIG: LayerConfig = LayerConfig {
-        specs: vec![
-            LayerSpec {
-                name: "batch".into(),
-                comment: Some("tasks under system.slice or tasks with nice value > 0".into()),
-                cpuset: None,
-                template: None,
-                matches: vec![
-                    vec![LayerMatch::CgroupPrefix("system.slice/".into())],
-                    vec![LayerMatch::NiceAbove(0)],
-                ],
-                kind: LayerKind::Confined {
-                    util_range: (0.8, 0.9),
-                    cpus_range: Some((0, 16)),
-                    cpus_range_frac: None,
-                    protected: false,
-                    membw_gb: None,
-                    common: LayerCommon {
-                        min_exec_us: 1000,
-                        yield_ignore: 0.0,
-                        preempt: false,
-                        preempt_first: false,
-                        exclusive: false,
-                        allow_node_aligned: false,
-                        skip_remote_node: false,
-                        prev_over_idle_core: false,
-                        idle_smt: None,
-                        slice_us: 20000,
-                        fifo: false,
-                        weight: DEFAULT_LAYER_WEIGHT,
-                        disallow_open_after_us: None,
-                        disallow_preempt_after_us: None,
-                        xllc_mig_min_us: 1000.0,
-                        growth_algo: LayerGrowthAlgo::Sticky,
-                        idle_resume_us: None,
-                        perf: 1024,
-                        nodes: vec![],
-                        llcs: vec![],
-                        member_expire_ms: 0,
-                        placement: LayerPlacement::Standard,
-                    },
-                },
-            },
-            LayerSpec {
-                name: "immediate".into(),
-                comment: Some("tasks under workload.slice with nice value < 0".into()),
-                cpuset: None,
-                template: None,
-                matches: vec![vec![
-                    LayerMatch::CgroupPrefix("workload.slice/".into()),
-                    LayerMatch::NiceBelow(0),
-                ]],
-                kind: LayerKind::Open {
-                    common: LayerCommon {
-                        min_exec_us: 100,
-                        yield_ignore: 0.25,
-                        preempt: true,
-                        preempt_first: false,
-                        exclusive: true,
-                        allow_node_aligned: true,
-                        skip_remote_node: false,
-                        prev_over_idle_core: true,
-                        idle_smt: None,
-                        slice_us: 20000,
-                        fifo: false,
-                        weight: DEFAULT_LAYER_WEIGHT,
-                        disallow_open_after_us: None,
-                        disallow_preempt_after_us: None,
-                        xllc_mig_min_us: 0.0,
-                        growth_algo: LayerGrowthAlgo::Sticky,
-                        perf: 1024,
-                        idle_resume_us: None,
-                        nodes: vec![],
-                        llcs: vec![],
-                        member_expire_ms: 0,
-                        placement: LayerPlacement::Standard,
-                    },
-                },
-            },
-            LayerSpec {
-                name: "stress-ng".into(),
-                comment: Some("stress-ng test layer".into()),
-                cpuset: None,
-                template: None,
-                matches: vec![
-                    vec![LayerMatch::CommPrefix("stress-ng".into()),],
-                    vec![LayerMatch::PcommPrefix("stress-ng".into()),]
-                ],
-                kind: LayerKind::Confined {
-                    cpus_range: None,
-                    util_range: (0.2, 0.8),
-                    protected: false,
-                    cpus_range_frac: None,
-                    membw_gb: None,
-                    common: LayerCommon {
-                        min_exec_us: 800,
-                        yield_ignore: 0.0,
-                        preempt: true,
-                        preempt_first: false,
-                        exclusive: false,
-                        allow_node_aligned: false,
-                        skip_remote_node: false,
-                        prev_over_idle_core: false,
-                        idle_smt: None,
-                        slice_us: 800,
-                        fifo: false,
-                        weight: DEFAULT_LAYER_WEIGHT,
-                        disallow_open_after_us: None,
-                        disallow_preempt_after_us: None,
-                        xllc_mig_min_us: 0.0,
-                        growth_algo: LayerGrowthAlgo::Topo,
-                        perf: 1024,
-                        idle_resume_us: None,
-                        nodes: vec![],
-                        llcs: vec![],
-                        member_expire_ms: 0,
-                        placement: LayerPlacement::Standard,
-                    },
-                },
-            },
-            LayerSpec {
-                name: "normal".into(),
-                comment: Some("the rest".into()),
-                cpuset: None,
-                template: None,
-                matches: vec![vec![]],
-                kind: LayerKind::Grouped {
-                    cpus_range: None,
-                    util_range: (0.5, 0.6),
-                    util_includes_open_cputime: true,
-                    protected: false,
-                    cpus_range_frac: None,
-                    membw_gb: None,
-                    common: LayerCommon {
-                        min_exec_us: 200,
-                        yield_ignore: 0.0,
-                        preempt: false,
-                        preempt_first: false,
-                        exclusive: false,
-                        allow_node_aligned: false,
-                        skip_remote_node: false,
-                        prev_over_idle_core: false,
-                        idle_smt: None,
-                        slice_us: 20000,
-                        fifo: false,
-                        weight: DEFAULT_LAYER_WEIGHT,
-                        disallow_open_after_us: None,
-                        disallow_preempt_after_us: None,
-                        xllc_mig_min_us: 100.0,
-                        growth_algo: LayerGrowthAlgo::Linear,
-                        perf: 1024,
-                        idle_resume_us: None,
-                        nodes: vec![],
-                        llcs: vec![],
-                        member_expire_ms: 0,
-                        placement: LayerPlacement::Standard,
-                    },
-                },
-            },
-        ],
-    };
+    static ref EXAMPLE_CONFIG: LayerConfig = serde_json::from_str(
+        r#"[
+          {
+            "name": "batch",
+            "comment": "tasks under system.slice or tasks with nice value > 0",
+            "matches": [[{"CgroupPrefix": "system.slice/"}], [{"NiceAbove": 0}]],
+            "kind": {"Confined": {
+              "util_range": [0.8, 0.9], "cpus_range": [0, 16],
+              "min_exec_us": 1000, "slice_us": 20000, "weight": 100,
+              "xllc_mig_min_us": 1000.0, "perf": 1024
+            }}
+          },
+          {
+            "name": "immediate",
+            "comment": "tasks under workload.slice with nice value < 0",
+            "matches": [[{"CgroupPrefix": "workload.slice/"}, {"NiceBelow": 0}]],
+            "kind": {"Open": {
+              "min_exec_us": 100, "yield_ignore": 0.25, "slice_us": 20000,
+              "preempt": true, "exclusive": true,
+              "prev_over_idle_core": true,
+              "weight": 100, "perf": 1024
+            }}
+          },
+          {
+            "name": "stress-ng",
+            "comment": "stress-ng test layer",
+            "matches": [[{"CommPrefix": "stress-ng"}], [{"PcommPrefix": "stress-ng"}]],
+            "kind": {"Confined": {
+              "util_range": [0.2, 0.8],
+              "min_exec_us": 800, "preempt": true, "slice_us": 800,
+              "weight": 100, "growth_algo": "Topo", "perf": 1024
+            }}
+          },
+          {
+            "name": "normal",
+            "comment": "the rest",
+            "matches": [[]],
+            "kind": {"Grouped": {
+              "util_range": [0.5, 0.6], "util_includes_open_cputime": true,
+              "min_exec_us": 200, "slice_us": 20000, "weight": 100,
+              "xllc_mig_min_us": 100.0, "growth_algo": "Linear", "perf": 1024
+            }}
+          }
+        ]"#,
+    )
+    .unwrap();
 }
 
 /// scx_layered: A highly configurable multi-layer sched_ext scheduler
@@ -458,10 +344,8 @@ lazy_static! {
 ///   other logical CPUs sharing the same core will be kept idle. This isn't
 ///   a hard guarantee, so don't depend on it for security purposes.
 ///
-/// - allow_node_aligned: Put node aligned tasks on layer DSQs instead of lo
-///   fallback. This is a hack to support node-affine tasks without making
-///   the whole scheduler node aware and should only be used with open
-///   layers on non-saturated machines to avoid possible stalls.
+/// - allow_node_aligned: DEPRECATED. Node-aligned tasks are now always
+///   dispatched on layer DSQs. This field is ignored if specified.
 ///
 /// - prev_over_idle_core: On SMT enabled systems, prefer using the same CPU
 ///   when picking a CPU for tasks on this layer, even if that CPUs SMT
@@ -488,10 +372,12 @@ lazy_static! {
 ///
 /// - idle_smt: *** DEPRECATED ****
 ///
-/// - growth_algo: When a layer is allocated new CPUs different algorithms can
-///   be used to determine which CPU should be allocated next. The default
-///   algorithm is a "sticky" algorithm that attempts to spread layers evenly
-///   across cores.
+/// - growth_algo: Determines the order in which CPUs are allocated to the
+///   layer as it grows. All algorithms are NUMA-aware and produce per-node
+///   core orderings. Most are locality algorithms that prefer the layer's
+///   home node and spill to remote nodes only when local capacity is
+///   exhausted. NUMA-spread algorithms (RoundRobin, NodeSpread*) instead
+///   enforce equal CPU counts across all NUMA nodes. Default: Sticky.
 ///
 /// - perf: CPU performance target. 0 means no configuration. A value
 ///   between 1 and 1024 indicates the performance level CPUs running tasks
@@ -551,7 +437,7 @@ lazy_static! {
 ///   ```bash
 ///   $ scx_layered --monitor 1
 ///   tot= 117909 local=86.20 open_idle= 0.21 affn_viol= 1.37 proc=6ms
-///   busy= 34.2 util= 1733.6 load=  21744.1 fallback_cpu=  1
+///   busy= 34.2 util= 1733.6 load=  21744.1 fb_cpus=[n0:1]
 ///     batch    : util/frac=   11.8/  0.7 load/frac=     29.7:  0.1 tasks=  2597
 ///                tot=   3478 local=67.80 open_idle= 0.00 preempt= 0.00 affn_viol= 0.00
 ///                cpus=  2 [  2,  2] 04000001 00000000
@@ -609,10 +495,6 @@ struct Opts {
     #[arg(short = 't', long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     disable_topology: Option<bool>,
 
-    /// Enable cross NUMA preemption.
-    #[clap(long)]
-    xnuma_preemption: bool,
-
     /// Disable monitor
     #[clap(long)]
     monitor_disable: bool,
@@ -642,9 +524,21 @@ struct Opts {
     #[clap(long)]
     monitor: Option<f64>,
 
+    /// Column limit for stats monitor output.
+    #[clap(long, default_value = "95")]
+    stats_columns: usize,
+
+    /// Disable per-LLC stats in monitor output.
+    #[clap(long)]
+    stats_no_llc: bool,
+
     /// Run with example layer specifications (useful for e.g. CI pipelines)
     #[clap(long)]
     run_example: bool,
+
+    /// Allocate CPUs at an SMT granularity (not core)
+    #[clap(long)]
+    allow_partial_core: bool,
 
     /// ***DEPRECATED *** Enables iteration over local LLCs first for
     /// dispatch.
@@ -834,22 +728,6 @@ fn copy_into_cstr(dst: &mut [i8], src: &str) {
     dst[0..bytes.len()].copy_from_slice(bytes);
 }
 
-fn nodemask_from_nodes(nodes: &Vec<usize>) -> usize {
-    let mut mask = 0;
-    for node in nodes {
-        mask |= 1 << node;
-    }
-    mask
-}
-
-fn llcmask_from_llcs(llcs: &BTreeMap<usize, Arc<Llc>>) -> usize {
-    let mut mask = 0;
-    for (_, cache) in llcs {
-        mask |= 1 << cache.id;
-    }
-    mask
-}
-
 fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
     let mut cpu_ctxs = vec![];
     let cpu_ctxs_vec = skel
@@ -859,9 +737,10 @@ fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
         .context("Failed to lookup cpu_ctx")?
         .unwrap();
     for cpu in 0..*NR_CPUS_POSSIBLE {
-        cpu_ctxs.push(*unsafe {
-            &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
-        });
+        cpu_ctxs.push(
+            *plain::from_bytes(cpu_ctxs_vec[cpu].as_slice())
+                .expect("cpu_ctx: short or misaligned buffer"),
+        );
     }
     Ok(cpu_ctxs)
 }
@@ -906,16 +785,14 @@ impl BpfStats {
             // kernel >= v6.12 fails verification after such
             // conversion due to seemingly verifier bugs. Convert to
             // bss maps later.
-            let key = llc_id as u32;
-            let llc_id_slice =
-                unsafe { std::slice::from_raw_parts((&key as *const u32) as *const u8, 4) };
             let v = skel
                 .maps
                 .llc_data
-                .lookup(llc_id_slice, libbpf_rs::MapFlags::ANY)
+                .lookup(&(llc_id as u32).to_ne_bytes(), libbpf_rs::MapFlags::ANY)
                 .unwrap()
                 .unwrap();
-            let llcc = unsafe { *(v.as_slice().as_ptr() as *const bpf_intf::llc_ctx) };
+            let llcc: &bpf_intf::llc_ctx =
+                plain::from_bytes(v.as_slice()).expect("llc_ctx: short or misaligned buffer");
 
             for layer_id in 0..nr_layers {
                 for stat_id in 0..NR_LLC_LSTATS {
@@ -972,13 +849,20 @@ impl<'a, 'b> Sub<&'b BpfStats> for &'a BpfStats {
 struct Stats {
     at: Instant,
     elapsed: Duration,
+    topo: Arc<Topology>,
     nr_layers: usize,
     nr_layer_tasks: Vec<usize>,
-    nr_nodes: usize,
+    layer_nr_node_pinned_tasks: Vec<Vec<u64>>,
 
     total_util: f64, // Running AVG of sum of layer_utils
     layer_utils: Vec<Vec<f64>>,
     prev_layer_usages: Vec<Vec<u64>>,
+    layer_node_pinned_utils: Vec<Vec<f64>>,
+    prev_layer_node_pinned_usages: Vec<Vec<u64>>,
+    layer_node_utils: Vec<Vec<f64>>,
+    prev_layer_node_usages: Vec<Vec<u64>>,
+    layer_node_duty_sums: Vec<Vec<f64>>, // Per-node per-layer duty in CPU units (EWMA)
+    prev_layer_node_duty_raw: Vec<Vec<u64>>, // Raw accumulated layer_duty_sum values
 
     layer_membws: Vec<Vec<f64>>, // Estimated memory bandsidth consumption
     prev_layer_membw_agg: Vec<Vec<u64>>, // Estimated aggregate membw consumption
@@ -1032,6 +916,62 @@ impl Stats {
         layer_membw_agg
     }
 
+    fn read_layer_node_pinned_usages(
+        cpu_ctxs: &[bpf_intf::cpu_ctx],
+        topo: &Topology,
+        nr_layers: usize,
+        nr_nodes: usize,
+    ) -> Vec<Vec<u64>> {
+        let mut usages = vec![vec![0u64; nr_nodes]; nr_layers];
+
+        for cpu in 0..*NR_CPUS_POSSIBLE {
+            let node = topo.all_cpus.get(&cpu).map_or(0, |c| c.node_id);
+            for layer in 0..nr_layers {
+                usages[layer][node] += cpu_ctxs[cpu].node_pinned_usage[layer];
+            }
+        }
+
+        usages
+    }
+
+    fn read_layer_node_usages(
+        cpu_ctxs: &[bpf_intf::cpu_ctx],
+        topo: &Topology,
+        nr_layers: usize,
+        nr_nodes: usize,
+    ) -> Vec<Vec<u64>> {
+        let mut usages = vec![vec![0u64; nr_nodes]; nr_layers];
+
+        for cpu in 0..*NR_CPUS_POSSIBLE {
+            let node = topo.all_cpus.get(&cpu).map_or(0, |c| c.node_id);
+            for layer in 0..nr_layers {
+                for usage in 0..=LAYER_USAGE_SUM_UPTO {
+                    usages[layer][node] += cpu_ctxs[cpu].layer_usages[layer][usage];
+                }
+            }
+        }
+
+        usages
+    }
+
+    fn read_layer_node_duty_raw(
+        cpu_ctxs: &[bpf_intf::cpu_ctx],
+        topo: &Topology,
+        nr_layers: usize,
+        nr_nodes: usize,
+    ) -> Vec<Vec<u64>> {
+        let mut sums = vec![vec![0u64; nr_nodes]; nr_layers];
+
+        for cpu in 0..*NR_CPUS_POSSIBLE {
+            let node = topo.all_cpus.get(&cpu).map_or(0, |c| c.node_id);
+            for layer in 0..nr_layers {
+                sums[layer][node] += cpu_ctxs[cpu].layer_duty_sum[layer];
+            }
+        }
+
+        sums
+    }
+
     /// Use the membw reported by resctrl to normalize the values reported by hw counters.
     /// We have the following problem:
     /// 1) We want per-task memory bandwidth reporting. We cannot do this with resctrl, much
@@ -1062,25 +1002,40 @@ impl Stats {
     fn new(
         skel: &mut BpfSkel,
         proc_reader: &fb_procfs::ProcReader,
+        topo: Arc<Topology>,
         gpu_task_affinitizer: &GpuTaskAffinitizer,
     ) -> Result<Self> {
         let nr_layers = skel.maps.rodata_data.as_ref().unwrap().nr_layers as usize;
+        let nr_nodes = topo.nodes.len();
         let cpu_ctxs = read_cpu_ctxs(skel)?;
         let bpf_stats = BpfStats::read(skel, &cpu_ctxs);
-        let nr_nodes = skel.maps.rodata_data.as_ref().unwrap().nr_nodes as usize;
         let pmu_membw = Self::read_layer_membw_agg(&cpu_ctxs, nr_layers);
 
         Ok(Self {
             at: Instant::now(),
             elapsed: Default::default(),
+
+            topo: topo.clone(),
             nr_layers,
             nr_layer_tasks: vec![0; nr_layers],
-            nr_nodes,
+            layer_nr_node_pinned_tasks: vec![vec![0; nr_nodes]; nr_layers],
 
             total_util: 0.0,
             layer_utils: vec![vec![0.0; NR_LAYER_USAGES]; nr_layers],
-            layer_membws: vec![vec![0.0; NR_LAYER_USAGES]; nr_layers],
             prev_layer_usages: Self::read_layer_usages(&cpu_ctxs, nr_layers),
+            layer_node_pinned_utils: vec![vec![0.0; nr_nodes]; nr_layers],
+            prev_layer_node_pinned_usages: Self::read_layer_node_pinned_usages(
+                &cpu_ctxs, &topo, nr_layers, nr_nodes,
+            ),
+            layer_node_utils: vec![vec![0.0; nr_nodes]; nr_layers],
+            prev_layer_node_usages: Self::read_layer_node_usages(
+                &cpu_ctxs, &topo, nr_layers, nr_nodes,
+            ),
+            layer_node_duty_sums: vec![vec![0.0; nr_nodes]; nr_layers],
+            prev_layer_node_duty_raw: Self::read_layer_node_duty_raw(
+                &cpu_ctxs, &topo, nr_layers, nr_nodes,
+            ),
+            layer_membws: vec![vec![0.0; NR_LAYER_USAGES]; nr_layers],
             // This is not normalized because we don't have enough history to do so.
             // It should not matter too much, since the value is dropped on the first
             // iteration.
@@ -1116,28 +1071,47 @@ impl Stats {
         let elapsed_f64 = elapsed.as_secs_f64();
         let cpu_ctxs = read_cpu_ctxs(skel)?;
 
-        let nr_layer_tasks: Vec<usize> = skel
-            .maps
-            .bss_data
-            .as_ref()
-            .unwrap()
-            .layers
+        let layers = &skel.maps.bss_data.as_ref().unwrap().layers;
+        let nr_layer_tasks: Vec<usize> = layers
             .iter()
             .take(self.nr_layers)
             .map(|layer| layer.nr_tasks as usize)
             .collect();
-        let layer_slice_us: Vec<u64> = skel
-            .maps
-            .bss_data
-            .as_ref()
-            .unwrap()
-            .layers
+        let layer_nr_node_pinned_tasks: Vec<Vec<u64>> = layers
+            .iter()
+            .take(self.nr_layers)
+            .map(|layer| {
+                layer.node[..self.topo.nodes.len()]
+                    .iter()
+                    .map(|n| n.nr_pinned_tasks)
+                    .collect()
+            })
+            .collect();
+        let layer_slice_us: Vec<u64> = layers
             .iter()
             .take(self.nr_layers)
             .map(|layer| layer.slice_ns / 1000_u64)
             .collect();
 
         let cur_layer_usages = Self::read_layer_usages(&cpu_ctxs, self.nr_layers);
+        let cur_layer_node_pinned_usages = Self::read_layer_node_pinned_usages(
+            &cpu_ctxs,
+            &self.topo,
+            self.nr_layers,
+            self.topo.nodes.len(),
+        );
+        let cur_layer_node_usages = Self::read_layer_node_usages(
+            &cpu_ctxs,
+            &self.topo,
+            self.nr_layers,
+            self.topo.nodes.len(),
+        );
+        let cur_layer_node_duty_raw = Self::read_layer_node_duty_raw(
+            &cpu_ctxs,
+            &self.topo,
+            self.nr_layers,
+            self.topo.nodes.len(),
+        );
         let cur_layer_membw_agg = Self::read_layer_membw_agg(&cpu_ctxs, self.nr_layers);
 
         // Memory BW normalization. It requires finding the delta according to perf, the delta
@@ -1215,6 +1189,24 @@ impl Stats {
 
         let layer_utils: Vec<Vec<f64>> =
             metric_decay(cur_layer_utils, &self.layer_utils, *USAGE_DECAY);
+        let cur_node_pinned_utils: Vec<Vec<f64>> = compute_diff(
+            &cur_layer_node_pinned_usages,
+            &self.prev_layer_node_pinned_usages,
+        );
+        let layer_node_pinned_utils: Vec<Vec<f64>> = metric_decay(
+            cur_node_pinned_utils,
+            &self.layer_node_pinned_utils,
+            *USAGE_DECAY,
+        );
+        let cur_node_utils: Vec<Vec<f64>> =
+            compute_diff(&cur_layer_node_usages, &self.prev_layer_node_usages);
+        let layer_node_utils: Vec<Vec<f64>> =
+            metric_decay(cur_node_utils, &self.layer_node_utils, *USAGE_DECAY);
+        let cur_node_duty: Vec<Vec<f64>> =
+            compute_diff(&cur_layer_node_duty_raw, &self.prev_layer_node_duty_raw);
+        let layer_node_duty_sums: Vec<Vec<f64>> =
+            metric_decay(cur_node_duty, &self.layer_node_duty_sums, *USAGE_DECAY);
+
         let layer_membws: Vec<Vec<f64>> = metric_decay(cur_layer_membw, &self.layer_membws, 0.0);
 
         let cur_total_cpu = read_total_cpu(proc_reader)?;
@@ -1262,17 +1254,25 @@ impl Stats {
         *self = Self {
             at: now,
             elapsed,
+            topo: self.topo.clone(),
             nr_layers: self.nr_layers,
             nr_layer_tasks,
-            nr_nodes: self.nr_nodes,
+            layer_nr_node_pinned_tasks,
 
             total_util: layer_utils
                 .iter()
                 .map(|x| x.iter().take(LAYER_USAGE_SUM_UPTO + 1).sum::<f64>())
                 .sum(),
             layer_utils,
-            layer_membws,
             prev_layer_usages: cur_layer_usages,
+            layer_node_pinned_utils,
+            prev_layer_node_pinned_usages: cur_layer_node_pinned_usages,
+            layer_node_utils,
+            prev_layer_node_usages: cur_layer_node_usages,
+            layer_node_duty_sums,
+            prev_layer_node_duty_raw: cur_layer_node_duty_raw,
+
+            layer_membws,
             prev_layer_membw_agg: cur_layer_membw_agg,
             // Was updated during normalization.
             prev_pmu_resctrl_membw: (pmu_cur, resctrl_cur),
@@ -1301,15 +1301,18 @@ struct Layer {
     name: String,
     kind: LayerKind,
     growth_algo: LayerGrowthAlgo,
-    core_order: Vec<usize>,
+    core_order: Vec<Vec<usize>>,
 
-    target_llc_cpus: (usize, usize),
-    assigned_llcs: Vec<usize>,
+    assigned_llcs: Vec<Vec<usize>>,
 
     nr_cpus: usize,
     nr_llc_cpus: Vec<usize>,
+    nr_node_cpus: Vec<usize>,
     cpus: Cpumask,
     allowed_cpus: Cpumask,
+
+    /// Per-node count of CPUs allocated for pinned demand.
+    nr_pinned_cpus: Vec<usize>,
 }
 
 fn get_kallsyms_addr(sym_name: &str) -> Result<u64> {
@@ -1351,7 +1354,7 @@ fn resolve_cpus_pct_range(
 }
 
 impl Layer {
-    fn new(spec: &LayerSpec, topo: &Topology, core_order: &Vec<usize>) -> Result<Self> {
+    fn new(spec: &LayerSpec, topo: &Topology, core_order: &Vec<Vec<usize>>) -> Result<Self> {
         let name = &spec.name;
         let kind = spec.kind.clone();
         let mut allowed_cpus = Cpumask::new();
@@ -1442,59 +1445,16 @@ impl Layer {
             growth_algo: layer_growth_algo,
             core_order: core_order.clone(),
 
-            target_llc_cpus: (0, 0),
-            assigned_llcs: vec![],
+            assigned_llcs: vec![vec![]; topo.nodes.len()],
 
             nr_cpus: 0,
             nr_llc_cpus: vec![0; topo.all_llcs.len()],
+            nr_node_cpus: vec![0; topo.nodes.len()],
             cpus: Cpumask::new(),
             allowed_cpus,
+
+            nr_pinned_cpus: vec![0; topo.nodes.len()],
         })
-    }
-
-    fn free_some_cpus(&mut self, cpu_pool: &mut CpuPool, max_to_free: usize) -> Result<usize> {
-        let cpus_to_free = match cpu_pool.next_to_free(&self.cpus, self.core_order.iter().rev())? {
-            Some(ret) => ret.clone(),
-            None => return Ok(0),
-        };
-
-        let nr_to_free = cpus_to_free.weight();
-
-        Ok(if nr_to_free <= max_to_free {
-            trace!("[{}] freeing CPUs: {}", self.name, &cpus_to_free);
-            self.cpus &= &cpus_to_free.not();
-            self.nr_cpus -= nr_to_free;
-            for cpu in cpus_to_free.iter() {
-                self.nr_llc_cpus[cpu_pool.topo.all_cpus[&cpu].llc_id] -= 1;
-            }
-            cpu_pool.free(&cpus_to_free)?;
-            nr_to_free
-        } else {
-            0
-        })
-    }
-
-    fn alloc_some_cpus(&mut self, cpu_pool: &mut CpuPool) -> Result<usize> {
-        let new_cpus = match cpu_pool
-            .alloc_cpus(&self.allowed_cpus, &self.core_order)
-            .clone()
-        {
-            Some(ret) => ret.clone(),
-            None => {
-                trace!("layer-{} can't grow, no CPUs", &self.name);
-                return Ok(0);
-            }
-        };
-
-        let nr_new_cpus = new_cpus.weight();
-
-        trace!("[{}] adding CPUs: {}", &self.name, &new_cpus);
-        self.cpus |= &new_cpus;
-        self.nr_cpus += nr_new_cpus;
-        for cpu in new_cpus.iter() {
-            self.nr_llc_cpus[cpu_pool.topo.all_cpus[&cpu].llc_id] += 1;
-        }
-        Ok(nr_new_cpus)
     }
 }
 #[derive(Debug, Clone)]
@@ -1728,12 +1688,133 @@ struct Scheduler<'a> {
     cgroup_regexes: Option<HashMap<u32, Regex>>,
 
     nr_layer_cpus_ranges: Vec<(usize, usize)>,
+    xnuma_mig_src: Vec<Vec<bool>>,
+    growth_denied: Vec<Vec<bool>>,
     processing_dur: Duration,
 
     topo: Arc<Topology>,
     netdevs: BTreeMap<String, NetDev>,
     stats_server: StatsServer<StatsReq, StatsRes>,
     gpu_task_handler: GpuTaskAffinitizer,
+}
+
+const DUTY_CYCLE_SCALE: f64 = (1u64 << 20) as f64;
+const XNUMA_RATE_DAMPEN: f64 = 0.5;
+
+/// Result of xnuma water-fill computation for a single layer.
+struct XnumaRates {
+    /// rates[src][dst]: migration rate in duty-cycle-scaled units.
+    rates: Vec<Vec<u64>>,
+}
+
+/// Determine per-node migration source state with two-threshold hysteresis.
+///
+/// Each (layer, node) independently decides if it's a migration source.
+/// Open (is_mig_src=true) requires all three:
+///   1. load/alloc > threshold.1 (significant load)
+///   2. surplus/alloc > delta.1 (significant imbalance)
+///   3. growth_denied (allocation can't solve it)
+///
+/// Close (is_mig_src=false) when any one:
+///   1. load/alloc < threshold.0 (load dropped)
+///   2. surplus/alloc < delta.0 (imbalance resolved)
+///   3. !growth_denied (growth succeeded)
+fn xnuma_check_active(
+    duty_sums: &[f64],
+    allocs: &[usize],
+    threshold: (f64, f64),
+    threshold_delta: (f64, f64),
+    growth_denied: &[bool],
+    currently_active: &[bool],
+) -> Vec<bool> {
+    let nr_nodes = duty_sums.len();
+    let total_duty: f64 = duty_sums.iter().sum();
+    let total_alloc: f64 = allocs.iter().map(|&a| a as f64).sum();
+    let eq_ratio = if total_alloc > 0.0 {
+        total_duty / total_alloc
+    } else {
+        0.0
+    };
+
+    let (thresh_lo, thresh_hi) = threshold;
+    let (delta_lo, delta_hi) = threshold_delta;
+
+    let mut result = vec![false; nr_nodes];
+    for nid in 0..nr_nodes {
+        let alloc = allocs[nid] as f64;
+        if alloc <= 0.0 {
+            if duty_sums[nid] > 0.0 && growth_denied[nid] {
+                result[nid] = true;
+            }
+            continue;
+        }
+
+        let load_ratio = duty_sums[nid] / alloc;
+        let surplus = duty_sums[nid] - eq_ratio * alloc;
+        let surplus_ratio = surplus / alloc;
+
+        let should_activate =
+            load_ratio > thresh_hi && surplus_ratio > delta_hi && growth_denied[nid];
+        let should_deactivate =
+            load_ratio < thresh_lo || surplus_ratio < delta_lo || !growth_denied[nid];
+
+        if should_activate {
+            result[nid] = true;
+        } else if should_deactivate {
+            result[nid] = false;
+        } else {
+            result[nid] = currently_active[nid];
+        }
+    }
+    result
+}
+
+/// Compute water-fill migration rates for a single layer.
+///
+/// Finds the equalization ratio (water line) across all nodes, then
+/// computes per-(src, dst) migration rates proportional to each source's
+/// surplus and each destination's share of total deficit.
+fn xnuma_compute_rates(duty_sums: &[f64], allocs: &[usize]) -> XnumaRates {
+    let nr_nodes = duty_sums.len();
+    let total_duty: f64 = duty_sums.iter().sum();
+    let total_alloc: f64 = allocs.iter().map(|&a| a as f64).sum();
+
+    if total_alloc <= 0.0 {
+        return XnumaRates {
+            rates: vec![vec![0u64; nr_nodes]; nr_nodes],
+        };
+    }
+
+    let eq_ratio = total_duty / total_alloc;
+
+    let mut surpluses = vec![0.0f64; nr_nodes];
+    let mut deficits = vec![0.0f64; nr_nodes];
+    for nid in 0..nr_nodes {
+        let expected = eq_ratio * allocs[nid] as f64;
+        let delta = duty_sums[nid] - expected;
+        if delta > 0.0 {
+            surpluses[nid] = delta;
+        } else {
+            deficits[nid] = -delta;
+        }
+    }
+
+    let total_deficit: f64 = deficits.iter().sum();
+
+    let mut rates = vec![vec![0u64; nr_nodes]; nr_nodes];
+    for src in 0..nr_nodes {
+        for dst in 0..nr_nodes {
+            if src == dst || total_deficit <= 0.0 || surpluses[src] <= 0.0 {
+                continue;
+            }
+            // Dampen: transfer half the surplus per cycle so convergence
+            // is gradual rather than a single-step overcorrection.
+            let migration = surpluses[src] * deficits[dst] / total_deficit * XNUMA_RATE_DAMPEN;
+            rates[src][dst] = (migration * DUTY_CYCLE_SCALE) as u64;
+        }
+    }
+
+    XnumaRates { rates }
 }
 
 impl<'a> Scheduler<'a> {
@@ -1915,11 +1996,9 @@ impl<'a> Scheduler<'a> {
                     preempt,
                     preempt_first,
                     exclusive,
-                    allow_node_aligned,
                     skip_remote_node,
                     prev_over_idle_core,
                     growth_algo,
-                    nodes,
                     slice_us,
                     fifo,
                     weight,
@@ -1947,7 +2026,6 @@ impl<'a> Scheduler<'a> {
                 layer.preempt.write(*preempt);
                 layer.preempt_first.write(*preempt_first);
                 layer.excl.write(*exclusive);
-                layer.allow_node_aligned.write(*allow_node_aligned);
                 layer.skip_remote_node.write(*skip_remote_node);
                 layer.prev_over_idle_core.write(*prev_over_idle_core);
                 layer.growth_algo = growth_algo.as_bpf_enum();
@@ -1964,13 +2042,6 @@ impl<'a> Scheduler<'a> {
                 layer.xllc_mig_min_ns = (xllc_mig_min_us * 1000.0) as u64;
                 layer_weights.push(layer.weight.try_into().unwrap());
                 layer.perf = u32::try_from(*perf)?;
-                layer.node_mask = nodemask_from_nodes(nodes) as u64;
-                for (topo_node_id, topo_node) in &topo.nodes {
-                    if !nodes.is_empty() && !nodes.contains(topo_node_id) {
-                        continue;
-                    }
-                    layer.llc_mask |= llcmask_from_llcs(&topo_node.llcs) as u64;
-                }
 
                 let task_place = |place: u32| crate::types::layer_task_place(place);
                 layer.task_place = match placement {
@@ -1996,11 +2067,13 @@ impl<'a> Scheduler<'a> {
             match &spec.cpuset {
                 Some(mask) => {
                     Self::update_cpumask(&mask, &mut layer.cpuset);
+                    layer.has_cpuset.write(true);
                 }
                 None => {
                     for i in 0..layer.cpuset.len() {
                         layer.cpuset[i] = u8::MAX;
                     }
+                    layer.has_cpuset.write(false);
                 }
             };
 
@@ -2138,16 +2211,8 @@ impl<'a> Scheduler<'a> {
 
     fn convert_cpu_ctxs(cpu_ctxs: Vec<bpf_intf::cpu_ctx>) -> Vec<Vec<u8>> {
         cpu_ctxs
-            .into_iter()
-            .map(|cpu_ctx| {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        &cpu_ctx as *const bpf_intf::cpu_ctx as *const u8,
-                        std::mem::size_of::<bpf_intf::cpu_ctx>(),
-                    )
-                };
-                bytes.to_vec()
-            })
+            .iter()
+            .map(|cpu_ctx| unsafe { plain::as_bytes(cpu_ctx) }.to_vec())
             .collect()
     }
 
@@ -2200,9 +2265,10 @@ impl<'a> Scheduler<'a> {
 
         // FIXME - this incorrectly assumes all possible CPUs are consecutive.
         for cpu in 0..*NR_CPUS_POSSIBLE {
-            cpu_ctxs.push(*unsafe {
-                &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
-            });
+            cpu_ctxs.push(
+                *plain::from_bytes(cpu_ctxs_vec[cpu].as_slice())
+                    .expect("cpu_ctx: short or misaligned buffer"),
+            );
 
             let topo_cpu = topo.all_cpus.get(&cpu).unwrap();
             let is_big = topo_cpu.core_type == CoreType::Big { turbo: true };
@@ -2304,16 +2370,15 @@ impl<'a> Scheduler<'a> {
             //
             // XXX - This would be a lot easier if llc_ctx were in the bss.
             // See BpfStats::read().
-            let key = llc_id as u32;
-            let llc_id_slice =
-                unsafe { std::slice::from_raw_parts((&key as *const u32) as *const u8, 4) };
+            let key = (llc_id as u32).to_ne_bytes();
             let v = skel
                 .maps
                 .llc_data
-                .lookup(llc_id_slice, libbpf_rs::MapFlags::ANY)
+                .lookup(&key, libbpf_rs::MapFlags::ANY)
                 .unwrap()
                 .unwrap();
-            let mut llcc = unsafe { *(v.as_slice().as_ptr() as *const bpf_intf::llc_ctx) };
+            let mut llcc: bpf_intf::llc_ctx =
+                *plain::from_bytes(v.as_slice()).expect("llc_ctx: short or misaligned buffer");
 
             let pmap = &mut llcc.prox_map;
             for (i, &llc_id) in order.iter().enumerate() {
@@ -2322,18 +2387,65 @@ impl<'a> Scheduler<'a> {
             pmap.node_end = node_end as u32;
             pmap.sys_end = sys_end as u32;
 
-            let v = unsafe {
-                std::slice::from_raw_parts(
-                    &llcc as *const bpf_intf::llc_ctx as *const u8,
-                    std::mem::size_of::<bpf_intf::llc_ctx>(),
-                )
-            };
-
-            skel.maps
-                .llc_data
-                .update(llc_id_slice, v, libbpf_rs::MapFlags::ANY)?
+            skel.maps.llc_data.update(
+                &key,
+                unsafe { plain::as_bytes(&llcc) },
+                libbpf_rs::MapFlags::ANY,
+            )?
         }
 
+        Ok(())
+    }
+
+    fn init_node_prox_map(skel: &mut BpfSkel, topo: &Topology) -> Result<()> {
+        for (&node_id, node) in &topo.nodes {
+            let mut order: Vec<(usize, usize)> = node
+                .distance
+                .iter()
+                .enumerate()
+                .filter(|&(nid, _)| nid != node_id)
+                .map(|(nid, &dist)| (nid, dist))
+                .collect();
+            order.sort_by_key(|&(_, dist)| dist);
+
+            let key = (node_id as u32).to_ne_bytes();
+
+            // The map entry may not exist yet — create a zeroed one.
+            let v = skel.maps.node_data.lookup(&key, libbpf_rs::MapFlags::ANY);
+            let mut nodec: bpf_intf::node_ctx = match v {
+                Ok(Some(v)) => {
+                    *plain::from_bytes(v.as_slice()).expect("node_ctx: short or misaligned buffer")
+                }
+                _ => unsafe { MaybeUninit::zeroed().assume_init() },
+            };
+
+            let pmap = &mut nodec.prox_map;
+            for (i, &(nid, _)) in order.iter().enumerate() {
+                pmap.nodes[i] = nid as u16;
+            }
+            pmap.sys_end = order.len() as u32;
+
+            debug!(
+                "NODE[{}] prox_map[{}]: {:?}",
+                node_id,
+                pmap.sys_end,
+                &order.iter().map(|(n, d)| (*n, *d)).collect::<Vec<_>>()
+            );
+
+            skel.maps.node_data.update(
+                &key,
+                unsafe { plain::as_bytes(&nodec) },
+                libbpf_rs::MapFlags::ANY,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn init_node_ctx(skel: &mut BpfSkel, topo: &Topology, nr_layers: usize) -> Result<()> {
+        let all_layers: Vec<u32> = (0..nr_layers as u32).collect();
+        let node_empty_layers: Vec<Vec<u32>> =
+            (0..topo.nodes.len()).map(|_| all_layers.clone()).collect();
+        Self::refresh_node_ctx(skel, topo, &node_empty_layers, true);
         Ok(())
     }
 
@@ -2372,10 +2484,21 @@ impl<'a> Scheduler<'a> {
         }
 
         let netdevs = if opts.netdev_irq_balance {
-            warn!(
-                "Experimental netdev IRQ balancing enabled. Reset IRQ masks of network devices after use!!!"
+            let devs = read_netdevs()?;
+            let total_irqs: usize = devs.values().map(|d| d.irqs.len()).sum();
+            let breakdown = devs
+                .iter()
+                .map(|(iface, d)| format!("{iface}={}", d.irqs.len()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            info!(
+                "Netdev IRQ balancing enabled: overriding {total_irqs} IRQ{} \
+                 across {} interface{} [{breakdown}]",
+                if total_irqs == 1 { "" } else { "s" },
+                devs.len(),
+                if devs.len() == 1 { "" } else { "s" },
             );
-            read_netdevs()?
+            devs
         } else {
             BTreeMap::new()
         };
@@ -2394,7 +2517,7 @@ impl<'a> Scheduler<'a> {
             );
         };
 
-        let cpu_pool = CpuPool::new(topo.clone())?;
+        let cpu_pool = CpuPool::new(topo.clone(), opts.allow_partial_core)?;
 
         // If disabling topology awareness clear out any set NUMA/LLC configs and
         // it will fallback to using all cores.
@@ -2412,6 +2535,75 @@ impl<'a> Scheduler<'a> {
         } else {
             layer_specs.to_vec()
         };
+
+        // Validate that spec node/LLC references exist in the topology.
+        for spec in layer_specs.iter() {
+            let mut seen = BTreeSet::new();
+            for &node_id in spec.nodes().iter() {
+                if !topo.nodes.contains_key(&node_id) {
+                    bail!(
+                        "layer {:?}: nodes references node {} which does not \
+                         exist in the topology (available: {:?})",
+                        spec.name,
+                        node_id,
+                        topo.nodes.keys().collect::<Vec<_>>()
+                    );
+                }
+                if !seen.insert(node_id) {
+                    bail!(
+                        "layer {:?}: nodes contains duplicate node {}",
+                        spec.name,
+                        node_id
+                    );
+                }
+            }
+
+            seen.clear();
+            for &llc_id in spec.llcs().iter() {
+                if !topo.all_llcs.contains_key(&llc_id) {
+                    bail!(
+                        "layer {:?}: llcs references LLC {} which does not \
+                         exist in the topology (available: {:?})",
+                        spec.name,
+                        llc_id,
+                        topo.all_llcs.keys().collect::<Vec<_>>()
+                    );
+                }
+                if !seen.insert(llc_id) {
+                    bail!(
+                        "layer {:?}: llcs contains duplicate LLC {}",
+                        spec.name,
+                        llc_id
+                    );
+                }
+            }
+        }
+
+        for spec in layer_specs.iter() {
+            let has_numa_node_match = spec
+                .matches
+                .iter()
+                .flatten()
+                .any(|m| matches!(m, LayerMatch::NumaNode(_)));
+            let has_node_spread_algo = matches!(
+                spec.kind.common().growth_algo,
+                LayerGrowthAlgo::NodeSpread
+                    | LayerGrowthAlgo::NodeSpreadReverse
+                    | LayerGrowthAlgo::NodeSpreadRandom
+            );
+            if has_numa_node_match && has_node_spread_algo {
+                bail!(
+                    "layer {:?}: NumaNode matcher cannot be combined with {:?} \
+                     growth algorithm. NodeSpread* allocates CPUs equally across \
+                     ALL NUMA nodes, but NumaNode restricts tasks to one node's \
+                     CPUs — CPUs on other nodes are wasted and utilization \
+                     will never exceed 1/numa_nodes. Use a non-spread algorithm \
+                     (e.g. Linear, Topo) instead.",
+                    spec.name,
+                    spec.kind.common().growth_algo
+                );
+            }
+        }
 
         // Check kernel features
         init_libbpf_logging(None);
@@ -2512,7 +2704,6 @@ impl<'a> Scheduler<'a> {
         rodata.nr_possible_cpus = *NR_CPUS_POSSIBLE as u32;
         rodata.smt_enabled = topo.smt_enabled;
         rodata.has_little_cores = topo.has_little_cores();
-        rodata.xnuma_preemption = opts.xnuma_preemption;
         rodata.antistall_sec = opts.antistall_sec;
         rodata.monitor_disable = opts.monitor_disable;
         rodata.lo_fb_wait_ns = opts.lo_fb_wait_us * 1000;
@@ -2580,12 +2771,6 @@ impl<'a> Scheduler<'a> {
             u64::MAX => *DFL_DISALLOW_PREEMPT_AFTER_US,
             v => v,
         };
-
-        // Consider all layers empty at the beginning.
-        for i in 0..layer_specs.len() {
-            skel.maps.bss_data.as_mut().unwrap().empty_layer_ids[i] = i as u32;
-        }
-        skel.maps.bss_data.as_mut().unwrap().nr_empty_layer_ids = nr_layers as u32;
 
         // We set the pin path before loading the skeleton. This will ensure
         // libbpf creates and pins the map, or reuses the pinned map fd for us,
@@ -2663,6 +2848,8 @@ impl<'a> Scheduler<'a> {
 
         Self::init_cpus(&skel, &layer_specs, &topo)?;
         Self::init_llc_prox_map(&mut skel, &topo)?;
+        Self::init_node_prox_map(&mut skel, &topo)?;
+        Self::init_node_ctx(&mut skel, &topo, nr_layers)?;
 
         // Other stuff.
         let proc_reader = fb_procfs::ProcReader::new();
@@ -2725,10 +2912,12 @@ impl<'a> Scheduler<'a> {
             layers,
             idle_qos_enabled,
 
-            sched_stats: Stats::new(&mut skel, &proc_reader, &gpu_task_handler)?,
+            sched_stats: Stats::new(&mut skel, &proc_reader, topo.clone(), &gpu_task_handler)?,
 
             cgroup_regexes: Some(cgroup_regexes),
             nr_layer_cpus_ranges: vec![(0, 0); nr_layers],
+            xnuma_mig_src: vec![vec![false; topo.nodes.len()]; nr_layers],
+            growth_denied: vec![vec![false; topo.nodes.len()]; nr_layers],
             processing_dur: Default::default(),
 
             proc_reader,
@@ -2763,6 +2952,9 @@ impl<'a> Scheduler<'a> {
         for (llc_id, &nr_llc_cpus) in layer.nr_llc_cpus.iter().enumerate() {
             bpf_layer.nr_llc_cpus[llc_id] = nr_llc_cpus as u32;
         }
+        for (node_id, &nr_node_cpus) in layer.nr_node_cpus.iter().enumerate() {
+            bpf_layer.node[node_id].nr_cpus = nr_node_cpus as u32;
+        }
 
         bpf_layer.refresh_cpus = 1;
     }
@@ -2778,8 +2970,7 @@ impl<'a> Scheduler<'a> {
                 .topo
                 .nodes
                 .values()
-                .take_while(|n| n.id == netdev.node())
-                .next()
+                .find(|n| n.id == netdev.node())
                 .ok_or_else(|| anyhow!("Failed to get netdev node"))?;
             let node_cpus = node.span.clone();
             for (irq, irqmask) in netdev.irqs.iter_mut() {
@@ -2799,6 +2990,11 @@ impl<'a> Scheduler<'a> {
                 trace!("{} updating irq {} cpumask {:?}", iface, irq, irqmask);
             }
             netdev.apply_cpumasks()?;
+            debug!(
+                "{iface}: applied affinity override to {} IRQ{}",
+                netdev.irqs.len(),
+                if netdev.irqs.len() == 1 { "" } else { "s" },
+            );
         }
 
         Ok(())
@@ -2823,6 +3019,78 @@ impl<'a> Scheduler<'a> {
         }
 
         return (membw_limit / last_membw_percpu) as usize;
+    }
+
+    /// Decompose per-layer CPU targets into per-node pinned demand and
+    /// unpinned demand for unified_alloc(). Uses layer_node_pinned_utils
+    /// to split each layer's target. All outputs are in alloc units.
+    fn calc_raw_demands(&self, targets: &[(usize, usize)]) -> Vec<LayerDemand> {
+        let au = self.cpu_pool.alloc_unit();
+        let pinned_utils = &self.sched_stats.layer_node_pinned_utils;
+        let nr_nodes = self.topo.nodes.len();
+
+        targets
+            .iter()
+            .enumerate()
+            .map(|(idx, &(target, _min))| {
+                let layer = &self.layers[idx];
+                let weight = layer.kind.common().weight as usize;
+
+                // Open layers don't participate in allocation.
+                if matches!(layer.kind, LayerKind::Open { .. }) {
+                    return LayerDemand {
+                        raw_pinned: vec![0; nr_nodes],
+                        raw_unpinned: 0,
+                        weight,
+                        spread: false,
+                    };
+                }
+
+                let spread = matches!(
+                    layer.growth_algo,
+                    LayerGrowthAlgo::NodeSpread
+                        | LayerGrowthAlgo::NodeSpreadReverse
+                        | LayerGrowthAlgo::NodeSpreadRandom
+                        | LayerGrowthAlgo::RoundRobin
+                );
+
+                let util_high = match &layer.kind {
+                    LayerKind::Confined { util_range, .. }
+                    | LayerKind::Grouped { util_range, .. } => util_range.1,
+                    _ => 1.0,
+                };
+
+                // Convert per-node pinned utilization to CPU demand.
+                let mut raw_pinned = vec![0usize; nr_nodes];
+                for n in 0..nr_nodes {
+                    let pu = pinned_utils[idx][n];
+                    if pu < 0.01 {
+                        continue;
+                    }
+                    // Check this layer has allowed_cpus on this node.
+                    let node_span = &self.topo.nodes[&n].span;
+                    if layer.allowed_cpus.and(node_span).is_empty() {
+                        continue;
+                    }
+                    let cpus = (pu / util_high).ceil() as usize;
+                    // Round up to alloc units.
+                    let units = (cpus + au - 1) / au;
+                    raw_pinned[n] = units;
+                }
+
+                // Unpinned = remainder of the target.
+                let target_units = target.div_ceil(au);
+                let pinned_units: usize = raw_pinned.iter().sum();
+                let raw_unpinned = target_units.saturating_sub(pinned_units);
+
+                LayerDemand {
+                    raw_pinned,
+                    raw_unpinned,
+                    weight,
+                    spread,
+                }
+            })
+            .collect()
     }
 
     /// Calculate how many CPUs each layer would like to have if there were
@@ -2930,84 +3198,6 @@ impl<'a> Scheduler<'a> {
         targets
     }
 
-    /// Given (target, min) pair for each layer which was determined
-    /// assuming infinite number of CPUs, distribute the actual CPUs
-    /// according to their weights.
-    fn weighted_target_nr_cpus(&self, targets: &[(usize, usize)]) -> Vec<usize> {
-        let mut nr_left = self.cpu_pool.topo.all_cpus.len();
-        let weights: Vec<usize> = self
-            .layers
-            .iter()
-            .map(|layer| layer.kind.common().weight as usize)
-            .collect();
-        let mut cands: BTreeMap<usize, (usize, usize, usize)> = targets
-            .iter()
-            .zip(&weights)
-            .enumerate()
-            .map(|(i, ((target, min), weight))| (i, (*target, *min, *weight)))
-            .collect();
-        let mut weight_sum: usize = weights.iter().sum();
-        let mut weighted: Vec<usize> = vec![0; self.layers.len()];
-
-        trace!("cands: {:?}", &cands);
-
-        // First, accept all layers that are <= min.
-        cands.retain(|&i, &mut (target, min, weight)| {
-            if target <= min {
-                let target = target.min(nr_left);
-                weighted[i] = target;
-                weight_sum -= weight;
-                nr_left -= target;
-                false
-            } else {
-                true
-            }
-        });
-
-        trace!("cands after accepting mins: {:?}", &cands);
-
-        // Keep accepting ones under their allotted share.
-        let calc_share = |nr_left, weight, weight_sum| {
-            (((nr_left * weight) as f64 / weight_sum as f64).ceil() as usize).min(nr_left)
-        };
-
-        while !cands.is_empty() {
-            let mut progress = false;
-
-            cands.retain(|&i, &mut (target, _min, weight)| {
-                let share = calc_share(nr_left, weight, weight_sum);
-                if target <= share {
-                    weighted[i] = target;
-                    weight_sum -= weight;
-                    nr_left -= target;
-                    progress = true;
-                    false
-                } else {
-                    true
-                }
-            });
-
-            if !progress {
-                break;
-            }
-        }
-
-        trace!("cands after accepting under allotted: {:?}", &cands);
-
-        // The remaining candidates are in contention with each other,
-        // distribute according to the shares.
-        let nr_to_share = nr_left;
-        for (i, (_target, _min, weight)) in cands.into_iter() {
-            let share = calc_share(nr_to_share, weight, weight_sum).min(nr_left);
-            weighted[i] = share;
-            nr_left -= share;
-        }
-
-        trace!("weighted: {:?}", &weighted);
-
-        weighted
-    }
-
     // Figure out a tuple (LLCs, extra_cpus) in terms of the target CPUs
     // computed by weighted_target_nr_cpus. Returns the number of full LLCs
     // occupied by a layer, and any extra CPUs that don't occupy a full LLC.
@@ -3025,146 +3215,157 @@ impl<'a> Scheduler<'a> {
     }
 
     // Recalculate the core order for layers using StickyDynamic growth
-    // algorithm. Tuples from compute_target_llcs are used to decide how many
-    // LLCs and cores should be assigned to each layer, logic to alloc and free
-    // CPUs operates on that core order. This happens in three logical steps, we
-    // first free LLCs from layers that shrunk from last recomputation, then
-    // distribute freed LLCs to growing layers, and then spill over remaining
-    // cores in free LLCs.
-    fn recompute_layer_core_order(&mut self, layer_targets: &Vec<(usize, usize)>) -> Result<bool> {
-        // Collect freed LLCs from shrinking layers.
+    // algorithm. Uses per-node targets from unified_alloc() to decide how
+    // many LLCs each layer gets on each node, then builds core_order and
+    // applies CPU changes.
+    fn recompute_layer_core_order(
+        &mut self,
+        layer_targets: &[(usize, usize)],
+        layer_allocs: &[LayerAlloc],
+        au: usize,
+    ) -> Result<bool> {
+        let nr_nodes = self.topo.nodes.len();
+
+        // Phase 1 — Free per-node: return excess LLCs to cpu_pool.
         debug!(
             " free: before pass: free_llcs={:?}",
             self.cpu_pool.free_llcs
         );
-        for &(idx, target) in layer_targets.iter().rev() {
+        for &(idx, _) in layer_targets.iter().rev() {
             let layer = &mut self.layers[idx];
-            let old_tlc = layer.target_llc_cpus;
-            let new_tlc = Self::compute_target_llcs(target, &self.topo);
 
             if layer.growth_algo != LayerGrowthAlgo::StickyDynamic {
                 continue;
             }
 
-            let mut to_free = (old_tlc.0 as i32 - new_tlc.0 as i32).max(0) as usize;
+            let alloc = &layer_allocs[idx];
 
-            debug!(
-                " free: layer={} old_tlc={:?} new_tlc={:?} to_free={} assigned={} free={}",
-                layer.name,
-                old_tlc,
-                new_tlc,
-                to_free,
-                layer.assigned_llcs.len(),
-                self.cpu_pool.free_llcs.len()
-            );
+            for n in 0..nr_nodes {
+                let assigned_on_n = layer.assigned_llcs[n].len();
+                let target_full_n =
+                    Self::compute_target_llcs(alloc.node_target(n) * au, &self.topo).0;
+                let mut to_free = assigned_on_n.saturating_sub(target_full_n);
 
-            while to_free > 0 && layer.assigned_llcs.len() > 0 {
-                let llc = layer.assigned_llcs.pop().unwrap();
-                self.cpu_pool.free_llcs.push((llc, 0));
-                to_free -= 1;
+                debug!(
+                    " free: layer={} node={} assigned={} target_full={} to_free={}",
+                    layer.name, n, assigned_on_n, target_full_n, to_free,
+                );
 
-                debug!(" layer={} freed_llc={}", layer.name, llc);
+                while to_free > 0 {
+                    if let Some(llc) = layer.assigned_llcs[n].pop() {
+                        self.cpu_pool.return_llc(llc);
+                        to_free -= 1;
+                        debug!(" layer={} freed_llc={} from node={}", layer.name, llc, n);
+                    } else {
+                        break;
+                    }
+                }
             }
         }
         debug!(" free: after pass: free_llcs={:?}", self.cpu_pool.free_llcs);
 
-        // Redistribute the freed LLCs to growing layers.
-        for &(idx, target) in layer_targets.iter().rev() {
+        // Phase 2 — Acquire per-node: claim LLCs from cpu_pool.
+        for &(idx, _) in layer_targets.iter().rev() {
             let layer = &mut self.layers[idx];
-            let old_tlc = layer.target_llc_cpus;
-            let new_tlc = Self::compute_target_llcs(target, &self.topo);
 
             if layer.growth_algo != LayerGrowthAlgo::StickyDynamic {
                 continue;
             }
 
-            let mut to_alloc = (new_tlc.0 as i32 - old_tlc.0 as i32).max(0) as usize;
+            let alloc = &layer_allocs[idx];
 
-            debug!(
-                " alloc: layer={} old_tlc={:?} new_tlc={:?} to_alloc={} assigned={} free={}",
-                layer.name,
-                old_tlc,
-                new_tlc,
-                to_alloc,
-                layer.assigned_llcs.len(),
-                self.cpu_pool.free_llcs.len()
-            );
+            for n in 0..nr_nodes {
+                let cur_on_n = layer.assigned_llcs[n].len();
+                let target_full_n =
+                    Self::compute_target_llcs(alloc.node_target(n) * au, &self.topo).0;
+                let mut to_alloc = target_full_n.saturating_sub(cur_on_n);
 
-            while to_alloc > 0
-                && self.cpu_pool.free_llcs.len() > 0
-                && to_alloc <= self.cpu_pool.free_llcs.len()
-            {
-                let llc = self.cpu_pool.free_llcs.pop().unwrap().0;
-                layer.assigned_llcs.push(llc);
-                to_alloc -= 1;
+                debug!(
+                    " alloc: layer={} node={} cur={} target_full={} to_alloc={} free={}",
+                    layer.name,
+                    n,
+                    cur_on_n,
+                    target_full_n,
+                    to_alloc,
+                    self.cpu_pool.free_llcs.get(&n).map_or(0, |v| v.len()),
+                );
 
-                debug!(" layer={} alloc_llc={}", layer.name, llc);
+                while to_alloc > 0 {
+                    if let Some(llc) = self.cpu_pool.take_llc_from_node(n) {
+                        layer.assigned_llcs[n].push(llc);
+                        to_alloc -= 1;
+                        debug!(" layer={} alloc_llc={} on node={}", layer.name, llc, n);
+                    } else {
+                        break;
+                    }
+                }
             }
 
             debug!(
                 " alloc: layer={} assigned_llcs={:?}",
                 layer.name, layer.assigned_llcs
             );
-
-            // Update for next iteration.
-            layer.target_llc_cpus = new_tlc;
         }
 
-        // Spillover overflowing cores into free LLCs. Bigger layers get to take
-        // a chunk before smaller layers.
+        // Phase 3 — Spillover per-node: consume extra cores from free LLCs.
+        let cores_per_llc = self.topo.all_cores.len() / self.topo.all_llcs.len();
+        let cpus_per_core = self.topo.all_cores.first_key_value().unwrap().1.cpus.len();
+        let cpus_per_llc = cores_per_llc * cpus_per_core;
+
         for &(idx, _) in layer_targets.iter() {
-            let mut core_order = vec![];
             let layer = &mut self.layers[idx];
 
             if layer.growth_algo != LayerGrowthAlgo::StickyDynamic {
                 continue;
             }
 
-            let tlc = layer.target_llc_cpus;
-            let mut extra = tlc.1;
-            // TODO(kkd): Move this logic into cpu_pool? What's the best place?
-            let cores_per_llc = self.topo.all_cores.len() / self.topo.all_llcs.len();
-            let cpus_per_core = self.topo.all_cores.first_key_value().unwrap().1.cpus.len();
-            let cpus_per_llc = cores_per_llc * cpus_per_core;
+            layer.core_order = vec![Vec::new(); nr_nodes];
+            let alloc = &layer_allocs[idx];
 
-            // Consume from front since we pop from the back.
-            for i in 0..self.cpu_pool.free_llcs.len() {
-                let free_vec = &mut self.cpu_pool.free_llcs;
-                // Available CPUs in LLC.
-                let avail = cpus_per_llc - free_vec[i].1;
-                // The amount we'll use.
-                let mut used = extra.min(avail);
-                let cores_to_add = used;
+            for n in 0..nr_nodes {
+                let mut extra = Self::compute_target_llcs(alloc.node_target(n) * au, &self.topo).1;
 
-                let shift = free_vec[i].1;
-                free_vec[i].1 += used;
+                if let Some(node_llcs) = self.cpu_pool.free_llcs.get_mut(&n) {
+                    for entry in node_llcs.iter_mut() {
+                        if extra == 0 {
+                            break;
+                        }
+                        let avail = cpus_per_llc - entry.1;
+                        let mut used = extra.min(avail);
+                        let cores_to_add = used;
 
-                let llc_id = free_vec[i].0;
-                let llc = self.topo.all_llcs.get(&llc_id).unwrap();
+                        let shift = entry.1;
+                        entry.1 += used;
 
-                for core in llc.cores.iter().skip(shift) {
-                    if used == 0 {
-                        break;
+                        let llc_id = entry.0;
+                        let llc = self.topo.all_llcs.get(&llc_id).unwrap();
+
+                        for core in llc.cores.iter().skip(shift) {
+                            if used == 0 {
+                                break;
+                            }
+                            layer.core_order[n].push(core.1.id);
+                            used -= 1;
+                        }
+
+                        extra -= cores_to_add;
                     }
-                    core_order.push(core.1.id);
-                    used -= 1;
-                }
-
-                extra -= cores_to_add;
-                if extra == 0 {
-                    break;
                 }
             }
 
-            core_order.reverse();
-            layer.core_order = core_order;
+            for node_cores in &mut layer.core_order {
+                node_cores.reverse();
+            }
         }
 
         // Reset consumed entries in free LLCs.
-        for i in 0..self.cpu_pool.free_llcs.len() {
-            self.cpu_pool.free_llcs[i].1 = 0;
+        for node_llcs in self.cpu_pool.free_llcs.values_mut() {
+            for entry in node_llcs.iter_mut() {
+                entry.1 = 0;
+            }
         }
 
+        // Phase 4 — Build core_order: append cores from assigned LLCs.
         for &(idx, _) in layer_targets.iter() {
             let layer = &mut self.layers[idx];
 
@@ -3172,14 +3373,19 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
+            let all_assigned: HashSet<usize> =
+                layer.assigned_llcs.iter().flatten().copied().collect();
+
             for core in self.topo.all_cores.iter() {
                 let llc_id = core.1.llc_id;
-                if layer.assigned_llcs.contains(&llc_id) {
-                    layer.core_order.push(core.1.id);
+                if all_assigned.contains(&llc_id) {
+                    let nid = core.1.node_id;
+                    layer.core_order[nid].push(core.1.id);
                 }
             }
-            // Update core_order for the layer, but reverse to keep the start stable.
-            layer.core_order.reverse();
+            for node_cores in &mut layer.core_order {
+                node_cores.reverse();
+            }
 
             debug!(
                 " alloc: layer={} core_order={:?}",
@@ -3187,12 +3393,11 @@ impl<'a> Scheduler<'a> {
             );
         }
 
-        // Apply CPU changes directly for StickyDynamic layers
-        // Do this in two phases: first free all CPUs, then allocate all CPUs
-        // This ensures freed CPUs are available for reallocation
+        // Phase 5 — Apply CPU changes for StickyDynamic layers.
+        // Two phases: first free per-node, then allocate per-node.
         let mut updated = false;
 
-        // Calculate target CPUs for all layers and free excess CPUs
+        // Free excess CPUs per-node.
         for &(idx, _) in layer_targets.iter() {
             let layer = &mut self.layers[idx];
 
@@ -3200,37 +3405,37 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            // Calculate new cpumask based on core_order (which includes both assigned LLCs and spillover cores)
-            let mut new_cpus = Cpumask::new();
-            for &core_id in &layer.core_order {
-                if let Some(core) = self.topo.all_cores.get(&core_id) {
-                    new_cpus |= &core.span;
+            for n in 0..nr_nodes {
+                let mut node_target = Cpumask::new();
+                for &core_id in &layer.core_order[n] {
+                    if let Some(core) = self.topo.all_cores.get(&core_id) {
+                        node_target |= &core.span;
+                    }
                 }
-            }
+                node_target &= &layer.allowed_cpus;
 
-            // Intersect with allowed_cpus
-            new_cpus &= &layer.allowed_cpus;
+                let node_span = &self.topo.nodes[&n].span;
+                let node_cur = layer.cpus.and(node_span);
+                let cpus_to_free = node_cur.and(&node_target.not());
 
-            // Determine CPUs to free (old cpus not in new cpus)
-            let cpus_to_free = layer.cpus.clone().and(&new_cpus.clone().not());
-
-            if cpus_to_free.weight() > 0 {
-                debug!(
-                    " apply: layer={} freeing CPUs: {}",
-                    layer.name, cpus_to_free
-                );
-                // Update layer state and free
-                layer.cpus &= &cpus_to_free.not();
-                layer.nr_cpus -= cpus_to_free.weight();
-                for cpu in cpus_to_free.iter() {
-                    layer.nr_llc_cpus[self.cpu_pool.topo.all_cpus[&cpu].llc_id] -= 1;
+                if cpus_to_free.weight() > 0 {
+                    debug!(
+                        " apply: layer={} freeing CPUs on node {}: {}",
+                        layer.name, n, cpus_to_free
+                    );
+                    layer.cpus &= &cpus_to_free.not();
+                    layer.nr_cpus -= cpus_to_free.weight();
+                    for cpu in cpus_to_free.iter() {
+                        layer.nr_llc_cpus[self.cpu_pool.topo.all_cpus[&cpu].llc_id] -= 1;
+                        layer.nr_node_cpus[n] -= 1;
+                    }
+                    self.cpu_pool.free(&cpus_to_free)?;
+                    updated = true;
                 }
-                self.cpu_pool.free(&cpus_to_free)?;
-                updated = true;
             }
         }
 
-        // Allocate needed CPUs to all layers
+        // Allocate needed CPUs per-node.
         for &(idx, _) in layer_targets.iter() {
             let layer = &mut self.layers[idx];
 
@@ -3238,42 +3443,43 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            // Recalculate target CPUs
-            let mut new_cpus = Cpumask::new();
-            for &core_id in &layer.core_order {
-                if let Some(core) = self.topo.all_cores.get(&core_id) {
-                    new_cpus |= &core.span;
+            for n in 0..nr_nodes {
+                let mut node_target = Cpumask::new();
+                for &core_id in &layer.core_order[n] {
+                    if let Some(core) = self.topo.all_cores.get(&core_id) {
+                        node_target |= &core.span;
+                    }
                 }
-            }
-            new_cpus &= &layer.allowed_cpus;
+                node_target &= &layer.allowed_cpus;
 
-            // Determine CPUs to allocate (new cpus not in old cpus, and whether they are available)
-            let available_cpus = self.cpu_pool.available_cpus();
-            let desired_to_alloc = new_cpus.clone().and(&layer.cpus.clone().not());
-            let cpus_to_alloc = desired_to_alloc.clone().and(&available_cpus);
+                let available_cpus = self.cpu_pool.available_cpus();
+                let desired_to_alloc = node_target.and(&layer.cpus.clone().not());
+                let cpus_to_alloc = desired_to_alloc.clone().and(&available_cpus);
 
-            if desired_to_alloc.weight() > cpus_to_alloc.weight() {
-                debug!(
-                    " apply: layer={} wanted to alloc {} CPUs but only {} available",
-                    layer.name,
-                    desired_to_alloc.weight(),
-                    cpus_to_alloc.weight()
-                );
-            }
-
-            if cpus_to_alloc.weight() > 0 {
-                debug!(
-                    " apply: layer={} allocating CPUs: {}",
-                    layer.name, cpus_to_alloc
-                );
-                // Update layer state and free
-                layer.cpus |= &cpus_to_alloc;
-                layer.nr_cpus += cpus_to_alloc.weight();
-                for cpu in cpus_to_alloc.iter() {
-                    layer.nr_llc_cpus[self.cpu_pool.topo.all_cpus[&cpu].llc_id] += 1;
+                if desired_to_alloc.weight() > cpus_to_alloc.weight() {
+                    debug!(
+                        " apply: layer={} node {} wanted to alloc {} CPUs but only {} available",
+                        layer.name,
+                        n,
+                        desired_to_alloc.weight(),
+                        cpus_to_alloc.weight()
+                    );
                 }
-                self.cpu_pool.mark_allocated(&cpus_to_alloc)?;
-                updated = true;
+
+                if cpus_to_alloc.weight() > 0 {
+                    debug!(
+                        " apply: layer={} allocating CPUs on node {}: {}",
+                        layer.name, n, cpus_to_alloc
+                    );
+                    layer.cpus |= &cpus_to_alloc;
+                    layer.nr_cpus += cpus_to_alloc.weight();
+                    for cpu in cpus_to_alloc.iter() {
+                        layer.nr_llc_cpus[self.cpu_pool.topo.all_cpus[&cpu].llc_id] += 1;
+                        layer.nr_node_cpus[n] += 1;
+                    }
+                    self.cpu_pool.mark_allocated(&cpus_to_alloc)?;
+                    updated = true;
+                }
             }
 
             debug!(
@@ -3287,17 +3493,131 @@ impl<'a> Scheduler<'a> {
         Ok(updated)
     }
 
+    fn refresh_node_ctx(
+        skel: &mut BpfSkel,
+        topo: &Topology,
+        node_empty_layers: &[Vec<u32>],
+        init: bool,
+    ) {
+        for &nid in topo.nodes.keys() {
+            let mut arg: bpf_intf::refresh_node_ctx_arg =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            arg.node_id = nid as u32;
+            arg.init = init as u32;
+
+            let empty = &node_empty_layers[nid];
+            arg.nr_empty_layer_ids = empty.len() as u32;
+            for (i, &lid) in empty.iter().enumerate() {
+                arg.empty_layer_ids[i] = lid;
+            }
+            for i in empty.len()..MAX_LAYERS {
+                arg.empty_layer_ids[i] = MAX_LAYERS as u32;
+            }
+
+            if init {
+                // Per-node LLC list — static topology, only set during init.
+                let node = &topo.nodes[&nid];
+                let llcs: Vec<u32> = node.llcs.keys().map(|&id| id as u32).collect();
+                arg.nr_llcs = llcs.len() as u32;
+                for (i, &llc_id) in llcs.iter().enumerate() {
+                    arg.llcs[i] = llc_id;
+                }
+            }
+
+            let input = ProgramInput {
+                context_in: Some(unsafe { plain::as_mut_bytes(&mut arg) }),
+                ..Default::default()
+            };
+            let _ = skel.progs.refresh_node_ctx.test_run(input);
+        }
+    }
+
     fn refresh_cpumasks(&mut self) -> Result<()> {
         let layer_is_open = |layer: &Layer| matches!(layer.kind, LayerKind::Open { .. });
 
         let mut updated = false;
-        let targets = self.calc_target_nr_cpus();
-        let targets = self.weighted_target_nr_cpus(&targets);
+        let raw_targets = self.calc_target_nr_cpus();
+        let au = self.cpu_pool.alloc_unit();
+        let total_cpus = self.cpu_pool.topo.all_cpus.len();
 
-        let mut ascending: Vec<(usize, usize)> = targets.iter().copied().enumerate().collect();
+        // Dampen shrink: only drop halfway per cycle to avoid unnecessary
+        // changes. There's some dampening built into util metrics but slow
+        // down freeing further. This is solely based on intuition. Drop or
+        // update according to real-world behavior.
+        let targets: Vec<(usize, usize)> = raw_targets
+            .iter()
+            .enumerate()
+            .map(|(idx, &(target, min))| {
+                let cur = self.layers[idx].nr_cpus;
+                if target < cur {
+                    let dampened = cur - (cur - target).div_ceil(2);
+                    (dampened.max(min), min)
+                } else {
+                    (target, min)
+                }
+            })
+            .collect();
+
+        // Build demands for unified_alloc and compute per-node allocations.
+        let demands = self.calc_raw_demands(&targets);
+        let nr_nodes = self.topo.nodes.len();
+        let node_caps: Vec<usize> = self
+            .topo
+            .nodes
+            .values()
+            .map(|n| n.span.weight() / au)
+            .collect();
+        let all_layer_nodes: Vec<&[usize]> = self
+            .layer_specs
+            .iter()
+            .map(|s| s.nodes().as_slice())
+            .collect();
+        let norders: Vec<Vec<usize>> = (0..self.layers.len())
+            .map(|idx| {
+                layer_core_growth::node_order(
+                    self.layer_specs[idx].nodes(),
+                    &self.topo,
+                    idx,
+                    &all_layer_nodes,
+                )
+            })
+            .collect();
+        let cur_node_cpus: Vec<Vec<usize>> = self
+            .layers
+            .iter()
+            .map(|layer| (0..nr_nodes).map(|n| layer.nr_node_cpus[n] / au).collect())
+            .collect();
+        let layer_allocs = unified_alloc(
+            total_cpus / au,
+            &node_caps,
+            &demands,
+            &cur_node_cpus,
+            &norders,
+        );
+
+        // Convert allocations back to CPU counts. Shrink dampening is
+        // already applied to the targets fed into unified_alloc above.
+        let cpu_targets: Vec<usize> = layer_allocs.iter().map(|a| a.total() * au).collect();
+
+        // Snapshot per-layer CPU counts for ALLOC debug logging.
+        let prev_nr_cpus: Vec<usize> = self.layers.iter().map(|l| l.nr_cpus).collect();
+
+        let mut ascending: Vec<(usize, usize)> = cpu_targets.iter().copied().enumerate().collect();
         ascending.sort_by(|a, b| a.1.cmp(&b.1));
 
-        let sticky_dynamic_updated = self.recompute_layer_core_order(&ascending)?;
+        // Snapshot per-layer per-node CPU counts before allocation changes.
+        let prev_node_cpus: Vec<Vec<usize>> =
+            self.layers.iter().map(|l| l.nr_node_cpus.clone()).collect();
+
+        // Per-node SD allocation requires multiple LLCs. On flat topologies
+        // (single LLC, e.g. VMs with topology disabled), SD layers fall through
+        // to the non-SD grow/shrink loops below.
+        let use_sd_alloc = self.topo.all_llcs.len() > 1;
+        let sticky_dynamic_updated = if use_sd_alloc {
+            self.recompute_layer_core_order(&ascending, &layer_allocs, au)?
+        } else {
+            false
+        };
         updated |= sticky_dynamic_updated;
 
         // Update BPF cpumasks for StickyDynamic layers if they were updated
@@ -3312,60 +3632,54 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // If any layer is growing, guarantee that the largest layer that is
-        // freeing CPUs frees at least one CPU.
-        let mut force_free = self
-            .layers
-            .iter()
-            .zip(targets.iter())
-            .any(|(layer, &target)| layer.nr_cpus < target);
-
-        // Shrink all layers first so that CPUs are available for
-        // redistribution. Do so in the descending target number of CPUs
-        // order.
-        for &(idx, target) in ascending.iter().rev() {
+        // Shrink per-node: free excess CPUs from each node.
+        for &(idx, _target) in ascending.iter().rev() {
             let layer = &mut self.layers[idx];
             if layer_is_open(layer) {
                 continue;
             }
 
-            // Skip StickyDynamic layers as they are managed in recompute_layer_core_order
-            if layer.growth_algo == LayerGrowthAlgo::StickyDynamic {
+            // Skip StickyDynamic layers when per-node SD allocation is active.
+            if layer.growth_algo == LayerGrowthAlgo::StickyDynamic && use_sd_alloc {
                 continue;
             }
 
-            let nr_cur = layer.cpus.weight();
-            if nr_cur <= target {
-                continue;
-            }
-            let mut nr_to_free = nr_cur - target;
-
-            // There's some dampening built into util metrics but slow down
-            // freeing further to avoid unnecessary changes. This is solely
-            // based on intution. Drop or update according to real-world
-            // behavior.
-            let nr_to_break_at = nr_to_free / 2;
-
+            let alloc = &layer_allocs[idx];
             let mut freed = false;
 
-            while nr_to_free > 0 {
-                let max_to_free = if force_free {
-                    force_free = false;
-                    layer.nr_cpus
-                } else {
-                    nr_to_free
-                };
+            for n in 0..nr_nodes {
+                let desired = alloc.node_target(n) * au;
+                let mut to_free = layer.nr_node_cpus[n].saturating_sub(desired);
+                let node_span = &self.topo.nodes[&n].span;
 
-                let nr_freed = layer.free_some_cpus(&mut self.cpu_pool, max_to_free)?;
-                if nr_freed == 0 {
-                    break;
-                }
-
-                nr_to_free = nr_to_free.saturating_sub(nr_freed);
-                freed = true;
-
-                if nr_to_free <= nr_to_break_at {
-                    break;
+                while to_free > 0 {
+                    let node_cands = layer.cpus.and(node_span);
+                    let cpus_to_free = match self
+                        .cpu_pool
+                        .next_to_free(&node_cands, layer.core_order[n].iter().rev())?
+                    {
+                        Some(ret) => ret,
+                        None => break,
+                    };
+                    let nr = cpus_to_free.weight();
+                    trace!(
+                        "[{}] freeing CPUs on node {}: {}",
+                        layer.name,
+                        n,
+                        &cpus_to_free
+                    );
+                    layer.cpus &= &cpus_to_free.not();
+                    layer.nr_cpus -= nr;
+                    for cpu in cpus_to_free.iter() {
+                        let node_id = self.cpu_pool.topo.all_cpus[&cpu].node_id;
+                        layer.nr_llc_cpus[self.cpu_pool.topo.all_cpus[&cpu].llc_id] -= 1;
+                        layer.nr_node_cpus[node_id] -= 1;
+                        layer.nr_pinned_cpus[node_id] =
+                            layer.nr_pinned_cpus[node_id].min(layer.nr_node_cpus[node_id]);
+                    }
+                    self.cpu_pool.free(&cpus_to_free)?;
+                    to_free = to_free.saturating_sub(nr);
+                    freed = true;
                 }
             }
 
@@ -3378,38 +3692,62 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // Grow layers. Do so in the ascending target number of CPUs order
-        // so that we're always more generous to smaller layers. This avoids
-        // starving small layers and shouldn't make noticeable difference for
-        // bigger layers as work conservation should still be achieved
-        // through open execution.
-        for &(idx, target) in &ascending {
+        // Grow layers per-node using allocations from unified_alloc.
+        for &(idx, _target) in &ascending {
             let layer = &mut self.layers[idx];
 
             if layer_is_open(layer) {
                 continue;
             }
 
-            // Skip StickyDynamic layers as they are managed in recompute_layer_core_order
-            if layer.growth_algo == LayerGrowthAlgo::StickyDynamic {
+            // Skip StickyDynamic layers when per-node SD allocation is active.
+            if layer.growth_algo == LayerGrowthAlgo::StickyDynamic && use_sd_alloc {
                 continue;
             }
 
-            let nr_cur = layer.cpus.weight();
-            if nr_cur >= target {
-                continue;
-            }
-
-            let mut nr_to_alloc = target - nr_cur;
+            let alloc = &layer_allocs[idx];
+            let norder = &norders[idx];
             let mut alloced = false;
 
-            while nr_to_alloc > 0 {
-                let nr_alloced = layer.alloc_some_cpus(&mut self.cpu_pool)?;
-                if nr_alloced == 0 {
-                    break;
+            for &node_id in norder.iter() {
+                let node_target = alloc.node_target(node_id) * au;
+                let cur_node = layer.nr_node_cpus[node_id];
+                if node_target <= cur_node {
+                    continue;
                 }
-                alloced = true;
-                nr_to_alloc -= nr_alloced.min(nr_to_alloc);
+                let pinned_target = alloc.pinned[node_id] * au;
+                let mut nr_to_alloc = node_target - cur_node;
+                let node_span = &self.topo.nodes[&node_id].span;
+                let node_allowed = layer.allowed_cpus.and(node_span);
+
+                while nr_to_alloc > 0 {
+                    let nr_alloced = match self.cpu_pool.alloc_cpus(
+                        &node_allowed,
+                        &layer.core_order[node_id],
+                        nr_to_alloc,
+                    ) {
+                        Some(new_cpus) => {
+                            let nr = new_cpus.weight();
+                            layer.cpus |= &new_cpus;
+                            layer.nr_cpus += nr;
+                            for cpu in new_cpus.iter() {
+                                layer.nr_llc_cpus[self.cpu_pool.topo.all_cpus[&cpu].llc_id] += 1;
+                                let nid = self.cpu_pool.topo.all_cpus[&cpu].node_id;
+                                layer.nr_node_cpus[nid] += 1;
+                                if layer.nr_pinned_cpus[nid] < pinned_target {
+                                    layer.nr_pinned_cpus[nid] += 1;
+                                }
+                            }
+                            nr
+                        }
+                        None => 0,
+                    };
+                    if nr_alloced == 0 {
+                        break;
+                    }
+                    alloced = true;
+                    nr_to_alloc -= nr_alloced.min(nr_to_alloc);
+                }
             }
 
             if alloced {
@@ -3419,6 +3757,91 @@ impl<'a> Scheduler<'a> {
                 );
                 updated = true;
             }
+        }
+
+        // Recompute growth_denied: for each node, check whether the
+        // unpinned portion of the layer warranted growth (unpinned util /
+        // util_high > unpinned CPUs) but the node didn't gain CPUs.  Only
+        // unpinned matters because pinned tasks can't migrate cross-node.
+        let node_utils = &self.sched_stats.layer_node_utils;
+        let pinned_utils = &self.sched_stats.layer_node_pinned_utils;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            self.growth_denied[idx].fill(false);
+            let util_high = match layer.kind.util_range() {
+                Some((_, high)) => high,
+                None => continue,
+            };
+            for n in 0..nr_nodes {
+                let unpinned_util = (node_utils[idx][n] - pinned_utils[idx][n]).max(0.0);
+                let unpinned_cpus_needed = unpinned_util / util_high;
+                let unpinned_cpus_have =
+                    layer.nr_node_cpus[n].saturating_sub(layer.nr_pinned_cpus[n]) as f64;
+                let wanted = unpinned_cpus_needed > unpinned_cpus_have;
+                let got = layer.nr_node_cpus[n] > prev_node_cpus[idx][n];
+                if wanted && !got {
+                    self.growth_denied[idx][n] = true;
+                }
+            }
+        }
+
+        // Log per-layer allocation changes.
+        if updated {
+            for (idx, layer) in self.layers.iter().enumerate() {
+                if layer_is_open(layer) {
+                    continue;
+                }
+                let prev = prev_nr_cpus[idx];
+                let cur = layer.nr_cpus;
+                if prev != cur {
+                    debug!(
+                        "ALLOC {} algo={:?} cpus:{}→{} mask={:x}",
+                        layer.name, layer.growth_algo, prev, cur, layer.cpus,
+                    );
+                }
+            }
+            debug!(
+                "ALLOC pool_available={}",
+                self.cpu_pool.available_cpus().weight()
+            );
+        }
+
+        // Log allocation changes.
+        if updated {
+            let nr_nodes = self.topo.nodes.len();
+            for (idx, layer) in self.layers.iter().enumerate() {
+                if layer_is_open(layer) {
+                    continue;
+                }
+                let prev = &prev_node_cpus[idx];
+                let cur = &layer.nr_node_cpus;
+                if prev == cur {
+                    continue;
+                }
+                let per_node: String = (0..nr_nodes)
+                    .map(|n| format!("n{}:{}→{}", n, prev[n], cur[n]))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let prev_total: usize = prev.iter().sum();
+                let cur_total: usize = cur[..nr_nodes].iter().sum();
+                let target: String = (0..nr_nodes)
+                    .map(|n| format!("n{}:{}", n, layer_allocs[idx].node_target(n) * au))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                debug!(
+                    "ALLOC {} algo={:?} {} total:{}→{} target:[{}] mask={:x}",
+                    layer.name,
+                    layer.growth_algo,
+                    per_node,
+                    prev_total,
+                    cur_total,
+                    target,
+                    layer.cpus,
+                );
+            }
+            debug!(
+                "ALLOC pool_available={}",
+                self.cpu_pool.available_cpus().weight()
+            );
         }
 
         // Give the rest to the open layers.
@@ -3433,14 +3856,23 @@ impl<'a> Scheduler<'a> {
                 let nr_available_cpus = available_cpus.weight();
 
                 // Open layers need the intersection of allowed cpus and
-                // available cpus.
+                // available cpus. Recompute per-LLC and per-node counts
+                // since open layers bypass alloc/free.
                 layer.cpus = available_cpus;
                 layer.nr_cpus = nr_available_cpus;
+                for llc in self.cpu_pool.topo.all_llcs.values() {
+                    layer.nr_llc_cpus[llc.id] = layer.cpus.and(&llc.span).weight();
+                }
+                for node in self.cpu_pool.topo.nodes.values() {
+                    layer.nr_node_cpus[node.id] = layer.cpus.and(&node.span).weight();
+                    layer.nr_pinned_cpus[node.id] = 0;
+                }
                 Self::update_bpf_layer_cpumask(layer, bpf_layer);
             }
 
-            self.skel.maps.bss_data.as_mut().unwrap().fallback_cpu =
-                self.cpu_pool.fallback_cpu as u32;
+            for (&node_id, &cpu) in &self.cpu_pool.fallback_cpus {
+                self.skel.maps.bss_data.as_mut().unwrap().fallback_cpus[node_id] = cpu as u32;
+            }
 
             for (lidx, layer) in self.layers.iter().enumerate() {
                 self.nr_layer_cpus_ranges[lidx] = (
@@ -3456,23 +3888,24 @@ impl<'a> Scheduler<'a> {
             let prog = &mut self.skel.progs.refresh_layer_cpumasks;
             let _ = prog.test_run(input);
 
-            // Update empty_layers.
-            let empty_layer_ids: Vec<u32> = self
-                .layers
-                .iter()
-                .enumerate()
-                .filter(|(_idx, layer)| layer.nr_cpus == 0)
-                .map(|(idx, _layer)| idx as u32)
+            // Update per-node empty layer IDs via BPF prog.
+            let nr_nodes = self.topo.nodes.len();
+            let node_empty_layers: Vec<Vec<u32>> = (0..nr_nodes)
+                .map(|nid| {
+                    self.layers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_lidx, layer)| layer.nr_node_cpus[nid] == 0)
+                        .map(|(lidx, _)| lidx as u32)
+                        .collect()
+                })
                 .collect();
-            for i in 0..self.layers.len() {
-                self.skel.maps.bss_data.as_mut().unwrap().empty_layer_ids[i] =
-                    empty_layer_ids.get(i).cloned().unwrap_or(MAX_LAYERS as u32);
-            }
-            self.skel.maps.bss_data.as_mut().unwrap().nr_empty_layer_ids =
-                empty_layer_ids.len() as u32;
+            Self::refresh_node_ctx(&mut self.skel, &self.topo, &node_empty_layers, false);
         }
 
-        let _ = self.update_netdev_cpumasks();
+        if let Err(e) = self.update_netdev_cpumasks() {
+            warn!("Failed to update netdev IRQ cpumasks: {:#}", e);
+        }
         Ok(())
     }
 
@@ -3494,6 +3927,59 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(())
+    }
+
+    fn refresh_xnuma(&mut self) {
+        let nr_nodes = self.topo.nodes.len();
+        if nr_nodes <= 1 {
+            return;
+        }
+
+        let duty_sums = &self.sched_stats.layer_node_duty_sums;
+
+        for (layer_idx, spec) in self.layer_specs.iter().enumerate() {
+            let common = spec.kind.common();
+            let threshold = common.xnuma_threshold;
+            let threshold_delta = common.xnuma_threshold_delta;
+            let bpf_layer = &mut self.skel.maps.bss_data.as_mut().unwrap().layers[layer_idx];
+
+            if threshold.0 <= 0.0 && threshold.1 <= 0.0 {
+                // Off — all open, infinite budget
+                for src in 0..nr_nodes {
+                    bpf_layer.node[src].xnuma_is_mig_src.write(true);
+                    for dst in 0..nr_nodes {
+                        bpf_layer.node[src].xnuma[dst].rate = u64::MAX;
+                    }
+                }
+                self.xnuma_mig_src[layer_idx].fill(false);
+                continue;
+            }
+
+            let layer = &self.layers[layer_idx];
+            let is_mig_src = xnuma_check_active(
+                &duty_sums[layer_idx],
+                &layer.nr_node_cpus,
+                threshold,
+                threshold_delta,
+                &self.growth_denied[layer_idx],
+                &self.xnuma_mig_src[layer_idx],
+            );
+
+            self.xnuma_mig_src[layer_idx] = is_mig_src.clone();
+
+            let result = xnuma_compute_rates(&duty_sums[layer_idx], &layer.nr_node_cpus);
+
+            // Write rates before is_mig_src so BPF sees valid rates
+            // when the gate activates.
+            for src in 0..nr_nodes {
+                for dst in 0..nr_nodes {
+                    bpf_layer.node[src].xnuma[dst].rate = result.rates[src][dst];
+                }
+            }
+            for nid in 0..nr_nodes {
+                bpf_layer.node[nid].xnuma_is_mig_src.write(is_mig_src[nid]);
+            }
+        }
     }
 
     fn step(&mut self) -> Result<()> {
@@ -3525,6 +4011,7 @@ impl<'a> Scheduler<'a> {
         }
 
         self.refresh_cpumasks()?;
+        self.refresh_xnuma();
         self.refresh_idle_qos()?;
         self.gpu_task_handler.maybe_affinitize();
         self.processing_dur += Instant::now().duration_since(started_at);
@@ -3537,10 +4024,17 @@ impl<'a> Scheduler<'a> {
         cpus_ranges: &mut [(usize, usize)],
     ) -> Result<SysStats> {
         let bstats = &stats.bpf_stats;
-        let mut sys_stats = SysStats::new(stats, bstats, self.cpu_pool.fallback_cpu)?;
+        let mut sys_stats = SysStats::new(stats, bstats, &self.cpu_pool.fallback_cpus)?;
 
         for (lidx, (spec, layer)) in self.layer_specs.iter().zip(self.layers.iter()).enumerate() {
-            let layer_stats = LayerStats::new(lidx, layer, stats, bstats, cpus_ranges[lidx]);
+            let layer_stats = LayerStats::new(
+                lidx,
+                layer,
+                stats,
+                bstats,
+                cpus_ranges[lidx],
+                self.xnuma_mig_src[lidx].iter().any(|&a| a),
+            );
             sys_stats.layers.insert(spec.name.to_string(), layer_stats);
             cpus_ranges[lidx] = (layer.nr_cpus, layer.nr_cpus);
         }
@@ -3827,7 +4321,7 @@ impl<'a> Scheduler<'a> {
                             self.layers.iter().map(|l| (l.nr_cpus, l.nr_cpus)).collect(),
                         );
                         let stats =
-                            Stats::new(&mut self.skel, &self.proc_reader, &self.gpu_task_handler)?;
+                            Stats::new(&mut self.skel, &self.proc_reader, self.topo.clone(), &self.gpu_task_handler)?;
                         res_ch.send(StatsRes::Hello(stats))?;
                     }
                     Ok(StatsReq::Refresh(tid, mut stats)) => {
@@ -3903,6 +4397,15 @@ impl<'a> Scheduler<'a> {
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {SCHEDULER_NAME} scheduler");
+
+        if !self.netdevs.is_empty() {
+            for (iface, netdev) in &self.netdevs {
+                if let Err(e) = netdev.restore_cpumasks() {
+                    warn!("Failed to restore {iface} IRQ affinity: {e}");
+                }
+            }
+            info!("Restored original netdev IRQ affinity");
+        }
 
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
@@ -4362,8 +4865,15 @@ fn main(opts: Opts) -> Result<()> {
 
     if let Some(intv) = opts.monitor.or(opts.stats) {
         let shutdown_copy = shutdown.clone();
+        let stats_columns = opts.stats_columns;
+        let stats_no_llc = opts.stats_no_llc;
         let jh = std::thread::spawn(move || {
-            match stats::monitor(Duration::from_secs_f64(intv), shutdown_copy) {
+            match stats::monitor(
+                Duration::from_secs_f64(intv),
+                shutdown_copy,
+                stats_columns,
+                stats_no_llc,
+            ) {
                 Ok(_) => {
                     debug!("stats monitor thread finished successfully")
                 }
@@ -4472,6 +4982,10 @@ fn main(opts: Opts) -> Result<()> {
         if common.idle_smt.is_some() {
             warn!("Layer {} has deprecated flag \"idle_smt\"", &spec.name);
         }
+
+        if common.allow_node_aligned.is_some() {
+            warn!("Layer {} has deprecated flag \"allow_node_aligned\", node-aligned tasks are now always dispatched on layer DSQs", &spec.name);
+        }
     }
 
     let membw_required = layer_config.specs.iter().any(|spec| match spec.kind {
@@ -4504,4 +5018,633 @@ fn main(opts: Opts) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod xnuma_tests {
+    use super::*;
+
+    // Default thresholds for tests
+    const THRESH: (f64, f64) = (0.6, 0.7);
+    const DELTA: (f64, f64) = (0.2, 0.3);
+
+    // =====================================================================
+    // xnuma_check_active tests — per-(layer, node) two-threshold
+    // =====================================================================
+
+    #[test]
+    fn test_activation_below_threshold() {
+        // Both nodes below threshold — both closed
+        let duty = vec![40.0, 40.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, true];
+        let cur = vec![false, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // ratio = 0.42 < 0.6 (low) → deactivate
+        assert!(!result[0]);
+        assert!(!result[1]);
+    }
+
+    #[test]
+    fn test_activation_above_all_thresholds() {
+        // N0 overloaded + imbalanced + growth denied → open
+        let duty = vec![90.0, 20.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, false];
+        let cur = vec![false, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // N0: load=0.94>0.7, eq=110/192=0.573, surplus=90-55=35, ratio=0.365>0.3, gd=true → open
+        assert!(result[0]);
+        // N1: load=0.21<0.6 → closed
+        assert!(!result[1]);
+    }
+
+    #[test]
+    fn test_activation_requires_growth_denied() {
+        // N0 overloaded + imbalanced but growth NOT denied → closed
+        let duty = vec![90.0, 20.0];
+        let allocs = vec![96, 96];
+        let gd = vec![false, false]; // growth succeeded
+        let cur = vec![false, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        assert!(!result[0]); // !growth_denied → deactivate
+    }
+
+    #[test]
+    fn test_symmetric_high_load_stays_closed() {
+        // Both nodes above threshold but balanced (delta=0) → closed
+        let duty = vec![80.0, 80.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, true];
+        let cur = vec![false, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // load=0.83>0.7 but surplus=0, surplus_ratio=0 < 0.3 → no activation
+        assert!(!result[0]);
+        assert!(!result[1]);
+    }
+
+    #[test]
+    fn test_hysteresis_stays_active() {
+        // N0 was active, now between thresholds → stays active
+        let duty = vec![75.0, 20.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, false];
+        let cur = vec![true, false]; // N0 was active
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // N0: load=0.78 > 0.6(lo) and < 0.7(hi), surplus=(75-20)/2=27.5, ratio=0.286 > 0.2(lo)
+        // gd=true. activate: 0.78<0.7 NO. deactivate: 0.78>0.6 NO, 0.286>0.2 NO, gd=true NO
+        // → hysteresis preserves true
+        assert!(result[0]);
+    }
+
+    #[test]
+    fn test_hysteresis_stays_inactive() {
+        // N0 was inactive, in hysteresis band → stays inactive
+        let duty = vec![75.0, 20.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, false];
+        let cur = vec![false, false]; // N0 was inactive
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // Same conditions but currently inactive → stays inactive
+        assert!(!result[0]);
+    }
+
+    #[test]
+    fn test_deactivation_load_drops() {
+        // N0 was active, load drops below low → closes
+        let duty = vec![50.0, 50.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, true];
+        let cur = vec![true, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // N0: load=0.52 < 0.6(lo) → deactivate
+        assert!(!result[0]);
+    }
+
+    #[test]
+    fn test_deactivation_growth_succeeds() {
+        // N0 was active, growth now succeeds → closes
+        let duty = vec![90.0, 20.0];
+        let allocs = vec![96, 96];
+        let gd = vec![false, false]; // growth succeeded
+        let cur = vec![true, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // !growth_denied → deactivate regardless of load/delta
+        assert!(!result[0]);
+    }
+
+    #[test]
+    fn test_zero_alloc_with_duty_and_growth_denied() {
+        // Zero alloc but duty > 0 and growth denied → open
+        let duty = vec![50.0, 0.0];
+        let allocs = vec![0, 96];
+        let gd = vec![true, false];
+        let cur = vec![false, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        assert!(result[0]); // zero alloc + duty + gd → source
+    }
+
+    #[test]
+    fn test_all_zero_alloc() {
+        let duty = vec![0.0, 0.0];
+        let allocs = vec![0, 0];
+        let gd = vec![true, true];
+        let cur = vec![true, true];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        assert!(!result[0]);
+        assert!(!result[1]);
+    }
+
+    #[test]
+    fn test_three_nodes_mixed() {
+        // 3 nodes: N0 overloaded+imbalanced+gd, N1 moderate, N2 low
+        let duty = vec![90.0, 40.0, 10.0];
+        let allocs = vec![96, 96, 96];
+        let gd = vec![true, true, false];
+        let cur = vec![false, false, false];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // eq_ratio = 140/288 ≈ 0.486
+        // N0: load=0.94>0.7, surplus=90-46.7=43.3, ratio=0.451>0.3, gd=true → open
+        assert!(result[0]);
+        // N1: load=0.42<0.6 → deactivate
+        assert!(!result[1]);
+        // N2: load=0.10<0.6 → deactivate
+        assert!(!result[2]);
+    }
+
+    #[test]
+    fn test_per_node_independence() {
+        // N0 active, N1 deactivates independently
+        let duty = vec![90.0, 50.0];
+        let allocs = vec![96, 96];
+        let gd = vec![true, true];
+        let cur = vec![true, true];
+        let result = xnuma_check_active(&duty, &allocs, THRESH, DELTA, &gd, &cur);
+        // N0: load=0.94>0.7, eq=140/192=0.729, surplus=90-70=20, ratio=0.208>0.2(lo)
+        //   activate: 0.94>0.7 YES, 0.208>0.3 NO → no activate
+        //   deactivate: 0.94>0.6 NO, 0.208>0.2 NO, gd=true NO → no deactivate → preserve true
+        assert!(result[0]);
+        // N1: load=0.52<0.6 → deactivate
+        assert!(!result[1]);
+    }
+
+    // =====================================================================
+    // xnuma_compute_rates tests — basic
+    // =====================================================================
+
+    #[test]
+    fn test_rates_balanced_load() {
+        // Equal load per CPU on both nodes — no migration needed
+        let duty = vec![48.0, 48.0];
+        let allocs = vec![96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // No surplus/deficit → all rates zero
+        for src in 0..2 {
+            for dst in 0..2 {
+                assert_eq!(result.rates[src][dst], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rates_one_overloaded() {
+        // N0 has 80 CPUs of duty, N1 has 40. Both have 96 CPUs.
+        // eq_ratio = 120/192 = 0.625
+        // N0 expected = 0.625 * 96 = 60, surplus = 80 - 60 = 20
+        // N1 expected = 0.625 * 96 = 60, deficit = 60 - 40 = 20
+        let duty = vec![80.0, 40.0];
+        let allocs = vec![96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // rate[0][1] should be positive (migrate from N0 to N1)
+        assert!(result.rates[0][1] > 0);
+        // rate[1][0] should be 0 (N1 has no surplus)
+        assert_eq!(result.rates[1][0], 0);
+        // Self-rates always 0
+        assert_eq!(result.rates[0][0], 0);
+        assert_eq!(result.rates[1][1], 0);
+
+        // Verify the rate magnitude: migration = 20.0 * DAMPEN, scaled
+        let expected_rate = (20.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][1], expected_rate);
+    }
+
+    #[test]
+    fn test_rates_asymmetric_allocation() {
+        // N0 has 48 CPUs, N1 has 144 CPUs. Duty 48 each.
+        // eq_ratio = 96/192 = 0.5
+        // N0 expected = 0.5 * 48 = 24, surplus = 48 - 24 = 24
+        // N1 expected = 0.5 * 144 = 72, deficit = 72 - 48 = 24
+        let duty = vec![48.0, 48.0];
+        let allocs = vec![48, 144];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        let expected_rate = (24.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][1], expected_rate);
+        assert_eq!(result.rates[1][0], 0);
+    }
+
+    // =====================================================================
+    // xnuma_compute_rates tests — multi-node
+    // =====================================================================
+
+    #[test]
+    fn test_rates_three_nodes_one_source() {
+        // N0 overloaded, N1 and N2 are deficit
+        // allocs: 96 each, duty: N0=120, N1=30, N2=30
+        // eq_ratio = 180/288 = 0.625
+        // N0 expected = 60, surplus = 60
+        // N1 expected = 60, deficit = 30
+        // N2 expected = 60, deficit = 30
+        let duty = vec![120.0, 30.0, 30.0];
+        let allocs = vec![96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // Total deficit = 60. N1 gets 30/60 = 50%, N2 gets 30/60 = 50%
+        // rate[0][1] = 60 * 30/60 * DAMPEN = 15
+        // rate[0][2] = 60 * 30/60 * DAMPEN = 15
+        let rate_01 = (30.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        let rate_02 = (30.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][1], rate_01);
+        assert_eq!(result.rates[0][2], rate_02);
+
+        // No reverse flow
+        assert_eq!(result.rates[1][0], 0);
+        assert_eq!(result.rates[2][0], 0);
+        assert_eq!(result.rates[1][2], 0);
+        assert_eq!(result.rates[2][1], 0);
+    }
+
+    #[test]
+    fn test_rates_three_nodes_unequal_deficit() {
+        // N0 overloaded. N1 slight deficit, N2 large deficit.
+        // allocs: 96 each, duty: N0=120, N1=50, N2=10
+        // eq_ratio = 180/288 = 0.625
+        // N0: expected=60, surplus=60
+        // N1: expected=60, deficit=10
+        // N2: expected=60, deficit=50
+        let duty = vec![120.0, 50.0, 10.0];
+        let allocs = vec![96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // Total deficit = 60. N1 share = 10/60, N2 share = 50/60
+        // rate[0][1] = 60 * 10/60 * DAMPEN = 5
+        // rate[0][2] = 60 * 50/60 * DAMPEN = 25
+        let rate_01 = (10.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        let rate_02 = (50.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][1], rate_01);
+        assert_eq!(result.rates[0][2], rate_02);
+    }
+
+    #[test]
+    fn test_rates_two_sources_one_sink() {
+        // N0 and N1 overloaded, N2 deficit
+        // allocs: 96 each, duty: N0=80, N1=70, N2=30
+        // total = 180, eq_ratio = 180/288 = 0.625
+        // N0: expected=60, surplus=20
+        // N1: expected=60, surplus=10
+        // N2: expected=60, deficit=30
+        let duty = vec![80.0, 70.0, 30.0];
+        let allocs = vec![96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // Total deficit = 30. Only N2 is deficit, so deficit share = 1.0
+        // rate[0][2] = 20 * 1.0 * DAMPEN = 10
+        // rate[1][2] = 10 * 1.0 * DAMPEN = 5
+        let rate_02 = (20.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        let rate_12 = (10.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][2], rate_02);
+        assert_eq!(result.rates[1][2], rate_12);
+
+        // No flow between sources
+        assert_eq!(result.rates[0][1], 0);
+        assert_eq!(result.rates[1][0], 0);
+    }
+
+    // =====================================================================
+    // Conservation invariants
+    // =====================================================================
+
+    #[test]
+    fn test_conservation_per_source_outbound() {
+        // Each source's total outbound should equal its surplus * DAMPEN (scaled).
+        // Total outbound from src = surplus[src] * DAMPEN * DUTY_CYCLE_SCALE
+        let duty = vec![100.0, 30.0, 50.0, 20.0];
+        let allocs = vec![96, 96, 96, 96];
+        let nr = 4;
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        let total_duty: f64 = duty.iter().sum();
+        let total_alloc: f64 = allocs.iter().map(|&a| a as f64).sum();
+        let eq_ratio = total_duty / total_alloc;
+
+        for src in 0..nr {
+            let expected = eq_ratio * allocs[src] as f64;
+            let surplus = (duty[src] - expected).max(0.0);
+            let total_outbound: u64 = (0..nr).map(|dst| result.rates[src][dst]).sum();
+            let expected_rate = (surplus * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+            assert_eq!(
+                total_outbound, expected_rate,
+                "node {} outbound mismatch",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn test_conservation_surplus_equals_deficit() {
+        // Mathematical invariant: total surplus == total deficit in water-fill
+        let duty = vec![100.0, 30.0, 50.0];
+        let allocs = vec![96, 96, 96];
+
+        let total_duty: f64 = duty.iter().sum();
+        let total_alloc: f64 = allocs.iter().map(|&a| a as f64).sum();
+        let eq_ratio = total_duty / total_alloc;
+
+        let mut total_surplus = 0.0f64;
+        let mut total_deficit = 0.0f64;
+        for i in 0..3 {
+            let expected = eq_ratio * allocs[i] as f64;
+            let delta = duty[i] - expected;
+            if delta > 0.0 {
+                total_surplus += delta;
+            } else {
+                total_deficit += -delta;
+            }
+        }
+        assert!((total_surplus - total_deficit).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_self_rates_always_zero() {
+        let duty = vec![100.0, 30.0, 50.0];
+        let allocs = vec![96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        for nid in 0..3 {
+            assert_eq!(result.rates[nid][nid], 0);
+        }
+    }
+
+    #[test]
+    fn test_deficit_nodes_have_zero_outbound() {
+        // Deficit nodes should have zero outbound rates
+        let duty = vec![100.0, 20.0, 30.0, 50.0];
+        let allocs = vec![96, 96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // eq_ratio = 200/384 ≈ 0.521. N0: surplus=50, N3: surplus=0
+        // N1: deficit=30, N2: deficit=20
+        // Deficit nodes (outbound sum == 0) should have all zero rates
+        for nid in 0..4 {
+            let outbound: u64 = (0..4).map(|dst| result.rates[nid][dst]).sum();
+            if outbound == 0 {
+                for dst in 0..4 {
+                    assert_eq!(
+                        result.rates[nid][dst], 0,
+                        "deficit node {} has non-zero rate to {}",
+                        nid, dst
+                    );
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // Edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_rates_zero_duty_everywhere() {
+        let duty = vec![0.0, 0.0];
+        let allocs = vec![96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        for src in 0..2 {
+            for dst in 0..2 {
+                assert_eq!(result.rates[src][dst], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rates_zero_alloc() {
+        let duty = vec![50.0, 50.0];
+        let allocs = vec![0, 0];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // total_alloc = 0 → early return with all zeros
+        for src in 0..2 {
+            for dst in 0..2 {
+                assert_eq!(result.rates[src][dst], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rates_all_load_one_node() {
+        // All duty on N0, nothing on N1
+        // allocs: 96 each, duty: N0=96, N1=0
+        // eq_ratio = 96/192 = 0.5
+        // N0: expected=48, surplus=48
+        // N1: expected=48, deficit=48
+        let duty = vec![96.0, 0.0];
+        let allocs = vec![96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        let expected_rate = (48.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][1], expected_rate);
+    }
+
+    #[test]
+    fn test_rates_single_node() {
+        // Single node — balanced by definition
+        let duty = vec![96.0];
+        let allocs = vec![96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        assert_eq!(result.rates[0][0], 0);
+    }
+
+    #[test]
+    fn test_rates_one_node_zero_alloc() {
+        // N0 has allocation, N1 has zero
+        // eq_ratio = 80/96
+        // N0: expected=80, surplus=0 → balanced
+        // N1: expected=0, deficit=0 → zero alloc skipped effectively
+        let duty = vec![80.0, 0.0];
+        let allocs = vec![96, 0];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // N0: surplus = 80 - (80/96 * 96) = 0
+        // N1: deficit = (80/96 * 0) - 0 = 0
+        // All zeros — nothing to migrate
+        assert_eq!(result.rates[0][1], 0);
+        assert_eq!(result.rates[1][0], 0);
+    }
+
+    // =====================================================================
+    // Rate magnitude and scaling
+    // =====================================================================
+
+    #[test]
+    fn test_rate_scaling() {
+        // Verify rates are in DUTY_CYCLE_SCALE units
+        let duty = vec![80.0, 40.0];
+        let allocs = vec![96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // surplus = 20, deficit = 20 → migration = 20 * DAMPEN = 10
+        // rate = 10 * (1 << 20)
+        let expected = (20.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+        assert_eq!(result.rates[0][1], expected);
+        assert_eq!(expected, 10 * (1 << 20));
+    }
+
+    #[test]
+    fn test_rates_tiny_imbalance() {
+        // Very small imbalance — should still produce non-zero rate
+        let duty = vec![48.001, 47.999];
+        let allocs = vec![96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // surplus ≈ 0.001, rate ≈ 0.001 * 2^20 ≈ 1048
+        assert!(result.rates[0][1] > 0);
+        assert!(result.rates[0][1] < (1 << 20)); // Less than 1.0 CPU worth
+    }
+
+    #[test]
+    fn test_rates_large_values() {
+        // Large system: 8 nodes, 96 CPUs each
+        let duty = vec![300.0, 100.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0];
+        let allocs = vec![96, 96, 96, 96, 96, 96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // eq_ratio = 700/768 ≈ 0.911. N0 surplus=212.5, N1 surplus=12.5
+        // N2-N7 deficit=37.5 each. N0 and N1 have surplus.
+        assert!(result.rates[0][2] > 0); // N0 → N2 (deficit node)
+        assert!(result.rates[1][2] > 0); // N1 → N2 (N1 also has surplus)
+
+        // Verify conservation: per-source outbound ≈ surplus * DAMPEN (within
+        // truncation tolerance — each `as u64` can lose up to 1 per cell)
+        let total_duty: f64 = duty.iter().sum();
+        let total_alloc: f64 = allocs.iter().map(|&a| a as f64).sum();
+        let eq_ratio = total_duty / total_alloc;
+        let nr = 8;
+        for src in 0..nr {
+            let surplus = (duty[src] - eq_ratio * allocs[src] as f64).max(0.0);
+            let outbound: u64 = (0..nr).map(|dst| result.rates[src][dst]).sum();
+            let expected = (surplus * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64;
+            let tolerance = nr as u64; // up to 1 per destination cell
+            assert!(
+                outbound.abs_diff(expected) <= tolerance,
+                "node {} outbound {} vs expected {}, diff {}",
+                src,
+                outbound,
+                expected,
+                outbound.abs_diff(expected)
+            );
+        }
+    }
+
+    // =====================================================================
+    // Hysteresis integration
+    // =====================================================================
+
+    #[test]
+    fn test_hysteresis_cycle() {
+        let allocs = vec![96, 96];
+        let gd = vec![true, false]; // N0 growth denied
+
+        // Start: all closed, low load
+        let active =
+            xnuma_check_active(&[40.0, 40.0], &allocs, THRESH, DELTA, &gd, &[false, false]);
+        assert!(!active[0]); // load 0.42 < 0.6(lo) → deactivate
+
+        // N0 overloaded + imbalanced + gd → opens
+        let active =
+            xnuma_check_active(&[90.0, 20.0], &allocs, THRESH, DELTA, &gd, &[false, false]);
+        assert!(active[0]); // load 0.94>0.7, surplus=35, ratio=0.365>0.3, gd=true
+
+        // Load decreases but in hysteresis band → stays open
+        let active = xnuma_check_active(&[75.0, 20.0], &allocs, THRESH, DELTA, &gd, &[true, false]);
+        assert!(active[0]); // load 0.78 between 0.6 and 0.7, surplus ok, gd → preserve
+
+        // Load drops below low threshold → closes
+        let active = xnuma_check_active(&[50.0, 50.0], &allocs, THRESH, DELTA, &gd, &[true, false]);
+        assert!(!active[0]); // load 0.52 < 0.6(lo) → deactivate
+    }
+
+    #[test]
+    fn test_hysteresis_growth_toggle() {
+        // N0 was open, then growth succeeds → closes
+        let allocs = vec![96, 96];
+        let gd_denied = vec![true, false];
+        let gd_ok = vec![false, false];
+
+        // Active with growth denied
+        let active = xnuma_check_active(
+            &[90.0, 20.0],
+            &allocs,
+            THRESH,
+            DELTA,
+            &gd_denied,
+            &[false, false],
+        );
+        assert!(active[0]);
+
+        // Growth succeeds → !gd → deactivate
+        let active = xnuma_check_active(
+            &[90.0, 20.0],
+            &allocs,
+            THRESH,
+            DELTA,
+            &gd_ok,
+            &[true, false],
+        );
+        assert!(!active[0]); // !growth_denied → deactivate
+    }
+
+    // =====================================================================
+    // Proportional distribution to multiple sinks
+    // =====================================================================
+
+    #[test]
+    fn test_proportional_sink_distribution() {
+        // 4 nodes: N0 source, N1-N3 sinks with different deficits
+        // allocs: 96 each, duty: N0=180, N1=20, N2=40, N3=0
+        // total = 240, eq_ratio = 240/384 = 0.625
+        // N0: expected=60, surplus=120
+        // N1: expected=60, deficit=40
+        // N2: expected=60, deficit=20
+        // N3: expected=60, deficit=60
+        // total_deficit = 120
+        let duty = vec![180.0, 20.0, 40.0, 0.0];
+        let allocs = vec![96, 96, 96, 96];
+        let result = xnuma_compute_rates(&duty, &allocs);
+
+        // rate[0][1] = 120 * 40/120 * DAMPEN = 20
+        // rate[0][2] = 120 * 20/120 * DAMPEN = 10
+        // rate[0][3] = 120 * 60/120 * DAMPEN = 30
+        assert_eq!(
+            result.rates[0][1],
+            (40.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64
+        );
+        assert_eq!(
+            result.rates[0][2],
+            (20.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64
+        );
+        assert_eq!(
+            result.rates[0][3],
+            (60.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64
+        );
+
+        // Total outbound from N0 = 20 + 10 + 30 = 60 (half of surplus, dampened)
+        let total_from_n0: u64 = (0..4).map(|dst| result.rates[0][dst]).sum();
+        assert_eq!(
+            total_from_n0,
+            (120.0 * XNUMA_RATE_DAMPEN * DUTY_CYCLE_SCALE) as u64
+        );
+    }
 }

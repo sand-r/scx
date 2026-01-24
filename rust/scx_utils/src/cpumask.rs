@@ -66,6 +66,33 @@ use std::ops::BitAndAssign;
 use std::ops::BitOrAssign;
 use std::ops::BitXorAssign;
 
+#[cfg(any(test, feature = "testutils"))]
+thread_local! {
+    /// Per-thread override for Cpumask width. 0 means use *NR_CPU_IDS.
+    /// Thread-local so parallel test threads don't interfere.
+    static MASK_WIDTH_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Return the effective Cpumask width: the test override if set, else *NR_CPU_IDS.
+fn mask_width() -> usize {
+    #[cfg(any(test, feature = "testutils"))]
+    {
+        let ovr = MASK_WIDTH_OVERRIDE.with(|c| c.get());
+        if ovr > 0 {
+            return ovr;
+        }
+    }
+    *NR_CPU_IDS
+}
+
+/// Override the Cpumask width for the current thread. All subsequent
+/// Cpumask::new(), from_str(), and related calls on this thread will use
+/// this width instead of NR_CPU_IDS. Set to 0 to restore the default.
+#[cfg(any(test, feature = "testutils"))]
+pub fn set_cpumask_test_width(width: usize) {
+    MASK_WIDTH_OVERRIDE.with(|c| c.set(width));
+}
+
 #[derive(Debug, Eq, Clone, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Cpumask {
     mask: BitVec<u64, Lsb0>,
@@ -73,8 +100,8 @@ pub struct Cpumask {
 
 impl Cpumask {
     fn check_cpu(&self, cpu: usize) -> Result<()> {
-        if cpu >= *NR_CPU_IDS {
-            bail!("Invalid CPU {} passed, max {}", cpu, *NR_CPU_IDS);
+        if cpu >= mask_width() {
+            bail!("Invalid CPU {} passed, max {}", cpu, mask_width());
         }
 
         Ok(())
@@ -83,7 +110,7 @@ impl Cpumask {
     /// Build a new empty Cpumask object.
     pub fn new() -> Cpumask {
         Cpumask {
-            mask: bitvec![u64, Lsb0; 0; *NR_CPU_IDS],
+            mask: bitvec![u64, Lsb0; 0; mask_width()],
         }
     }
 
@@ -91,11 +118,11 @@ impl Cpumask {
     pub fn from_str(cpumask: &str) -> Result<Cpumask> {
         match cpumask {
             "none" => {
-                let mask = bitvec![u64, Lsb0; 0; *NR_CPU_IDS];
+                let mask = bitvec![u64, Lsb0; 0; mask_width()];
                 return Ok(Self { mask });
             }
             "all" => {
-                let mask = bitvec![u64, Lsb0; 1; *NR_CPU_IDS];
+                let mask = bitvec![u64, Lsb0; 1; mask_width()];
                 return Ok(Self { mask });
             }
             _ => {}
@@ -113,14 +140,14 @@ impl Cpumask {
         let byte_vec =
             hex::decode(&hex_str).with_context(|| format!("Failed to parse cpumask: {cpumask}"))?;
 
-        let mut mask = bitvec![u64, Lsb0; 0; *NR_CPU_IDS];
+        let mut mask = bitvec![u64, Lsb0; 0; mask_width()];
         for (index, &val) in byte_vec.iter().rev().enumerate() {
             let mut v = val;
             while v != 0 {
                 let lsb = v.trailing_zeros() as usize;
                 v &= !(1 << lsb);
                 let cpu = index * 8 + lsb;
-                if cpu > *NR_CPU_IDS {
+                if cpu >= mask_width() {
                     bail!(
                         concat!(
                             "Found cpu ({}) in cpumask ({}) which is larger",
@@ -128,7 +155,7 @@ impl Cpumask {
                         ),
                         cpu,
                         cpumask,
-                        *NR_CPU_IDS
+                        mask_width()
                     );
                 }
                 mask.set(cpu, true);
@@ -145,6 +172,41 @@ impl Cpumask {
         }
 
         Ok(mask)
+    }
+
+    /// Format the Cpumask as a compact CPU list string like "0-7,16-23".
+    /// Returns "none" if no CPUs are set.
+    pub fn to_cpulist(&self) -> String {
+        let cpus: Vec<usize> = self.iter().collect();
+        if cpus.is_empty() {
+            return String::from("none");
+        }
+
+        let mut ranges = Vec::new();
+        let mut start = cpus[0];
+        let mut end = cpus[0];
+
+        for &cpu in &cpus[1..] {
+            if cpu == end + 1 {
+                end = cpu;
+            } else {
+                ranges.push(if start == end {
+                    format!("{}", start)
+                } else {
+                    format!("{}-{}", start, end)
+                });
+                start = cpu;
+                end = cpu;
+            }
+        }
+
+        ranges.push(if start == end {
+            format!("{}", start)
+        } else {
+            format!("{}-{}", start, end)
+        });
+
+        ranges.join(",")
     }
 
     pub fn from_vec(vec: Vec<u64>) -> Self {
@@ -219,12 +281,12 @@ impl Cpumask {
 
     /// Return true if the Cpumask has all bits set, false otherwise.
     pub fn is_full(&self) -> bool {
-        self.mask.count_ones() == *NR_CPU_IDS
+        self.mask.count_ones() == mask_width()
     }
 
     /// The total size of the cpumask.
     pub fn len(&self) -> usize {
-        *NR_CPU_IDS
+        mask_width()
     }
 
     /// Create a Cpumask that is the negation of the current Cpumask.
@@ -309,10 +371,10 @@ impl Cpumask {
             .collect();
 
         // Throw out possible stray from u64 -> u32.
-        masks.truncate((*NR_CPU_IDS).div_ceil(32));
+        masks.truncate((mask_width()).div_ceil(32));
 
-        // Print the highest 32bit. Trim digits beyond *NR_CPU_IDS.
-        let width = match (*NR_CPU_IDS).div_ceil(4) % 8 {
+        // Print the highest 32bit. Trim digits beyond mask_width().
+        let width = match (mask_width()).div_ceil(4) % 8 {
             0 => 8,
             v => v,
         };
@@ -365,7 +427,7 @@ impl Iterator for CpumaskIterator<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < *NR_CPU_IDS {
+        while self.index < mask_width() {
             let index = self.index;
             self.index += 1;
             let bit_val = self.mask.test_cpu(index);
@@ -411,5 +473,72 @@ impl BitOrAssign<&Self> for Cpumask {
 impl BitXorAssign<&Self> for Cpumask {
     fn bitxor_assign(&mut self, rhs: &Self) {
         self.mask ^= &rhs.mask;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_cpulist_empty() {
+        let mask = Cpumask::new();
+        assert_eq!(mask.to_cpulist(), "none");
+    }
+
+    #[test]
+    fn test_to_cpulist_single_cpu() {
+        let mut mask = Cpumask::new();
+        mask.set_cpu(5).unwrap();
+        assert_eq!(mask.to_cpulist(), "5");
+    }
+
+    #[test]
+    fn test_to_cpulist_contiguous_range() {
+        let mut mask = Cpumask::new();
+        for cpu in 0..8 {
+            mask.set_cpu(cpu).unwrap();
+        }
+        assert_eq!(mask.to_cpulist(), "0-7");
+    }
+
+    #[test]
+    fn test_to_cpulist_multiple_ranges() {
+        let mut mask = Cpumask::new();
+        for cpu in 0..4 {
+            mask.set_cpu(cpu).unwrap();
+        }
+        for cpu in 8..12 {
+            mask.set_cpu(cpu).unwrap();
+        }
+        assert_eq!(mask.to_cpulist(), "0-3,8-11");
+    }
+
+    #[test]
+    fn test_to_cpulist_scattered() {
+        let mut mask = Cpumask::new();
+        mask.set_cpu(1).unwrap();
+        mask.set_cpu(3).unwrap();
+        mask.set_cpu(5).unwrap();
+        assert_eq!(mask.to_cpulist(), "1,3,5");
+    }
+
+    #[test]
+    fn test_to_cpulist_mixed() {
+        let mut mask = Cpumask::new();
+        mask.set_cpu(0).unwrap();
+        mask.set_cpu(1).unwrap();
+        mask.set_cpu(2).unwrap();
+        mask.set_cpu(5).unwrap();
+        mask.set_cpu(10).unwrap();
+        mask.set_cpu(11).unwrap();
+        assert_eq!(mask.to_cpulist(), "0-2,5,10-11");
+    }
+
+    #[test]
+    fn test_to_cpulist_roundtrip() {
+        let original = "0-3,8-11,16";
+        let mask = Cpumask::from_cpulist(original).unwrap();
+        assert_eq!(mask.to_cpulist(), original);
     }
 }

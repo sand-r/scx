@@ -127,14 +127,30 @@ struct Opts {
     slice_min_us: u64,
 
     /// Migration delta threshold percentage (0-100). When set to a non-zero value,
-    /// uses average utilization for threshold calculation instead of current
-    /// utilization, and the threshold is calculated as: avg_load * (mig-delta-pct / 100).
+    /// the migration threshold is mig-delta-pct percent of the average load.
     /// Additionally, disables force task stealing in the consume path, relying only
     /// on the is_stealer/is_stealee thresholds for more predictable load balancing.
     /// Default is 0 (disabled, uses dynamic threshold based on load with both
     /// probabilistic and force task stealing enabled). This is an experimental feature.
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
+
+    /// Low utilization threshold percentage (0-100) for periodic load balancing.
+    /// When set to a non-zero value, periodic load balancing is skipped when
+    /// average system utilization is below this percentage.
+    /// Default is 25 (skip periodic LB below 25% utilization).
+    /// Set to 0 to disable. Set to 100 to always skip periodic LB.
+    #[clap(long = "lb-low-util-pct", default_value = "25", value_parser=Opts::lb_low_util_pct_range)]
+    lb_low_util_pct: u8,
+
+    /// Low utilization threshold percentage (0-100) for bypassing deadline
+    /// scheduling. When set to a non-zero value, tasks are dispatched directly
+    /// to the local DSQ (FIFO) instead of using deadline-based ordering when
+    /// average system utilization is below this percentage.
+    /// Default is 10 (bypass deadline scheduling below 10% utilization).
+    /// Set to 0 to disable. Set to 100 to always bypass deadline scheduling.
+    #[clap(long = "lb-local-dsq-util-pct", default_value = "10", value_parser=Opts::lb_local_dsq_util_pct_range)]
+    lb_local_dsq_util_pct: u8,
 
     /// Slice duration in microseconds to use for all tasks when pinned tasks
     /// are running on a CPU. Must be between slice-min-us and slice-max-us.
@@ -193,6 +209,12 @@ struct Opts {
     /// This is a highly experimental feature.
     #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
     enable_cpu_bw: bool,
+
+    /// If specified, only tasks which have their scheduling policy set to
+    /// SCHED_EXT using sched_setscheduler(2) are switched. Otherwise, all
+    /// tasks are switched.
+    #[clap(long = "partial", action = clap::ArgAction::SetTrue)]
+    partial: bool,
 
     ///
     /// Disable core compaction so the scheduler uses all the online CPUs.
@@ -368,6 +390,14 @@ impl Opts {
     fn mig_delta_pct_range(s: &str) -> Result<u8, String> {
         number_range(s, 0, 100)
     }
+
+    fn lb_low_util_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
+
+    fn lb_local_dsq_util_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
 }
 
 unsafe impl Plain for msg_task_ctx {}
@@ -437,6 +467,12 @@ impl<'a> Scheduler<'a> {
         let order = CpuOrder::new(opts.topology.as_ref()).unwrap();
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
+
+        // When there are multiple domains, hook the execve() syscall family
+        // to enable aggressive cross-domain migration when execve() is called.
+        if order.cpdom_map.len() > 1 {
+            Self::attach_execve_tracepoints(&mut skel)?;
+        }
 
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, &opts, &order, debug_level);
@@ -511,6 +547,21 @@ impl<'a> Scheduler<'a> {
             (
                 "syscalls:sys_exit_futex_wake",
                 &skel.progs.rtp_sys_exit_futex_wake,
+            ),
+        ];
+
+        compat::cond_tracepoints_enable(tracepoints)
+    }
+
+    fn attach_execve_tracepoints(skel: &mut OpenBpfSkel) -> Result<bool> {
+        let tracepoints = vec![
+            (
+                "syscalls:sys_enter_execve",
+                &skel.progs.cond_hook_sys_enter_execve,
+            ),
+            (
+                "syscalls:sys_enter_execveat",
+                &skel.progs.cond_hook_sys_enter_execveat,
             ),
         ];
 
@@ -619,6 +670,8 @@ impl<'a> Scheduler<'a> {
         rodata.pinned_slice_ns = opts.pinned_slice_us.map(|v| v * 1000).unwrap_or(0);
         rodata.preempt_shift = opts.preempt_shift;
         rodata.mig_delta_pct = opts.mig_delta_pct;
+        rodata.lb_low_util_wall = ((opts.lb_low_util_pct as u64) << 10) / 100;
+        rodata.lb_local_dsq_util_wall = ((opts.lb_local_dsq_util_pct as u64) << 10) / 100;
         rodata.no_use_em = opts.no_use_em as u8;
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
@@ -634,6 +687,10 @@ impl<'a> Scheduler<'a> {
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+
+        if opts.partial {
+            skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
+        }
     }
 
     fn get_msg_seq_id() -> u64 {
@@ -677,25 +734,25 @@ impl<'a> Scheduler<'a> {
             suggested_cpu_id: tx.suggested_cpu_id,
             waker_pid: tx.waker_pid,
             waker_comm: waker_comm.into(),
-            slice: tx.slice,
+            slice_wall: tx.slice_wall,
             lat_cri: tx.lat_cri,
             avg_lat_cri: tx.avg_lat_cri,
             static_prio: tx.static_prio,
-            rerunnable_interval: tx.rerunnable_interval,
-            resched_interval: tx.resched_interval,
+            rerunnable_interval_wall: tx.rerunnable_interval_wall,
+            resched_interval_wall: tx.resched_interval_wall,
             run_freq: tx.run_freq,
-            avg_runtime: tx.avg_runtime,
+            avg_runtime_wall: tx.avg_runtime_wall,
             wait_freq: tx.wait_freq,
             wake_freq: tx.wake_freq,
             perf_cri: tx.perf_cri,
             thr_perf_cri: tx.thr_perf_cri,
             cpuperf_cur: tx.cpuperf_cur,
-            cpu_util: tx.cpu_util,
-            cpu_sutil: tx.cpu_sutil,
+            cpu_util_wall: tx.cpu_util_wall,
+            cpu_util_invr: tx.cpu_util_invr,
             nr_active: tx.nr_active,
             dsq_id: tx.dsq_id,
             dsq_consume_lat: tx.dsq_consume_lat,
-            slice_used: tx.last_slice_used,
+            slice_used_wall: tx.last_slice_used_wall,
         }) {
             Ok(()) | Err(TrySendError::Full(_)) => 0,
             Err(e) => panic!("failed to send on intrspc_tx ({})", e),

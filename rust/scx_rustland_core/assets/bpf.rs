@@ -11,6 +11,7 @@ use crate::bpf_skel::*;
 
 use std::ffi::c_int;
 use std::ffi::c_ulong;
+use std::ffi::CStr;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -93,14 +94,11 @@ impl QueuedTask {
     /// Convert the task's comm field (C char array) into a Rust String.
     #[allow(dead_code)]
     pub fn comm_str(&self) -> String {
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(self.comm.as_ptr() as *const u8, self.comm.len()) };
+        // Convert the C char array into a Rust String
+        let c_str = unsafe { CStr::from_ptr(self.comm.as_ptr()) };
 
-        // Find the first NUL byte, or take the whole array.
-        let nul_pos = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
-
-        // Convert to String (handle invalid UTF-8 gracefully).
-        String::from_utf8_lossy(&bytes[..nul_pos]).into_owned()
+        // Handle potential invalid UTF-8
+        c_str.to_string_lossy().into_owned()
     }
 }
 
@@ -185,7 +183,7 @@ pub struct BpfScheduler<'cb> {
 //
 // NOTE: make the buffer aligned to 64-bits to prevent misaligned dereferences when accessing the
 // buffer using a pointer.
-const BUFSIZE: usize = std::mem::size_of::<QueuedTask>();
+const BUFSIZE: usize = size_of::<queued_task_ctx>();
 
 #[repr(align(8))]
 struct AlignedBuffer([u8; BUFSIZE]);
@@ -206,6 +204,7 @@ fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
 }
 
 impl<'cb> BpfScheduler<'cb> {
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         open_object: &'cb mut MaybeUninit<OpenObject>,
         open_opts: Option<bpf_object_open_opts>,
@@ -515,24 +514,19 @@ impl<'cb> BpfScheduler<'cb> {
     // Receive a task to be scheduled from the BPF dispatcher.
     #[allow(static_mut_refs)]
     pub fn dequeue_task(&mut self) -> Result<Option<QueuedTask>, i32> {
+        let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
+        
         // Try to consume the first task from the ring buffer.
         match self.queued.consume_raw_n(1) {
             0 => {
                 // Ring buffer is empty.
-                self.skel.maps.bss_data.as_mut().unwrap().nr_queued = 0;
+                bss_data.nr_queued = 0;
                 Ok(None)
             }
             1 => {
                 // A valid task is received, convert data to a proper task struct.
                 let task = unsafe { EnqueuedMessage::from_bytes(&BUF.0).to_queued_task() };
-                self.skel.maps.bss_data.as_mut().unwrap().nr_queued = self
-                    .skel
-                    .maps
-                    .bss_data
-                    .as_ref()
-                    .unwrap()
-                    .nr_queued
-                    .saturating_sub(1);
+                bss_data.nr_queued = bss_data.nr_queued.saturating_sub(1);
 
                 Ok(Some(task))
             }
@@ -560,7 +554,7 @@ impl<'cb> BpfScheduler<'cb> {
             vtime,
             enq_cnt,
             ..
-        } = &mut dispatched_task.as_mut();
+        } = dispatched_task;
 
         *pid = task.pid;
         *cpu = task.cpu;

@@ -102,7 +102,6 @@ are provided for select distros.
 scx
 |-- scheds               : Sched_ext scheduler implementations
 |   |-- include          : Shared BPF and user C include files including vmlinux.h
-|   |-- c                : Example schedulers - userspace code written C
 |   \-- rust             : Example schedulers - userspace code written Rust
 \-- rust                 : Rust support code
     \-- scx_utils        : Common utility library for Rust schedulers
@@ -112,7 +111,6 @@ scx
 
 This repository provides two build systems:
 
-- **C schedulers**: Use `make`
 - **Rust schedulers**: Use `cargo`
 
 **Dependencies:**
@@ -139,14 +137,6 @@ You can append its contents to your kernel `.config` file to enable the necessar
 
 ### Building and Installing
 
-#### C Schedulers
-
-```shell
-$ cd $SCX
-$ make all                          # Build all C schedulers
-$ make install INSTALL_DIR=~/bin    # Install to custom directory
-```
-
 #### Rust Schedulers
 
 ```shell
@@ -165,12 +155,11 @@ See: [CARGO BUILD](CARGO_BUILD.md)
 
 ### Binary Locations
 
-- **C schedulers**: `build/scheds/c/scx_simple`
 - **Rust schedulers**: `target/release/scx_rusty`
 
 ### Environment Variables
 
-Both `make` and `cargo` support these environment variables for BPF compilation:
+`cargo` support these environment variables for BPF compilation:
 
 - `BPF_CLANG`: The clang command to use. (Default: `clang`)
 - `BPF_CFLAGS`: Override all compiler flags for BPF compilation
@@ -178,22 +167,11 @@ Both `make` and `cargo` support these environment variables for BPF compilation:
 - `BPF_EXTRA_CFLAGS_PRE_INCL`: Extra flags before include paths
 - `BPF_EXTRA_CFLAGS_POST_INCL`: Extra flags after include paths
 
-C schedulers only:
-
-- `BPFTOOL`: The bpftool command to use. (Default: `bpftool`)
-- `CC`: The C compiler to use. (Default: `cc`)
-
 **Examples:**
 
 ```shell
-# Use specific clang version for C schedulers
-$ BPF_CLANG=clang-17 make all
-
 # Use specific clang version for Rust schedulers
 $ BPF_CLANG=clang-17 cargo build --release
-
-# Use clang for C compilation and system bpftool
-$ CC=clang BPFTOOL=/usr/bin/bpftool make all
 ```
 
 ## Checking scx_stats
@@ -268,32 +246,13 @@ $ scx_rustland --monitor 5
 [RustLand] tasks -> r:  1/4  w: 1 /1  | pf: 0     | dispatch -> u: 33178 k: 0     c: 0     b: 0     f: 0     | cg: 0
 ```
 
+## systemd services
+
+See: [services](services/README.md)
+
 ## Kernel Feature Status
 
-The kernel feature is not yet upstream and can be found in the
-[`sched_ext`](https://github.com/sched-ext/sched_ext) repository. The
-following are important branches:
-
-- [`sched_ext`](https://github.com/sched-ext/sched_ext): The main development
-  branch. This branch periodically pulls from the
-  [bpf-next](https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/)
-  tree to stay in sync with the kernel and BPF developments.
-- `sched_ext-release-*`: `sched_ext` backports on top of released kernels. We
-  plan to maintain backports for a few recent kernel releases until
-  `sched_ext` is merged upstream. Currently maintained backports:
-  - [`sched_ext-release-v6.6`](https://github.com/sched-ext/sched_ext/tree/sched_ext-release-v6.6)
-- `sched_ext-vN`: Patchsets posted upstream. The `v4` LKML thread has
-  high-level discussions.
-  - [RFC](https://github.com/htejun/sched_ext):
-    [LMKL thread](http://lkml.kernel.org/r/20221130082313.3241517-1-tj@kernel.org)
-  - [`sched_ext-v2`](https://github.com/sched-ext/sched_ext/tree/sched_ext-v2):
-    [LKML thread](http://lkml.kernel.org/r/20230128001639.3510083-1-tj@kernel.org)
-  - [`sched_ext-v3`](https://github.com/sched-ext/sched_ext/tree/sched_ext-v3):
-    [LKML thread](http://lkml.kernel.org/r/20230317213333.2174969-1-tj@kernel.org)
-  - [`sched_ext-v4`](https://github.com/sched-ext/sched_ext/tree/sched_ext-v4):
-    [LKML thread](http://lkml.kernel.org/r/20230711011412.100319-1-tj@kernel.org)
-  - [`sched_ext-v5`](https://github.com/sched-ext/sched_ext/tree/sched_ext-v5):
-    [LKML thread](http://lkml.kernel.org/r/20231111024835.2164816-1-tj@kernel.org)
+sched-ext has been fully upstreamed as of 6.12.
 
 ## [Breaking Changes](./BREAKING_CHANGES.md)
 
@@ -303,6 +262,19 @@ following are important branches:
 
 Want to learn how to develop a scheduler or find some useful tools for working
 with schedulers? See the developer guide for more details.
+
+## Other sched_ext Schedulers
+
+- [**PANDEMONIUM**](https://github.com/wllclngn/PANDEMONIUM) - A scheduler
+  written in Rust and C that dynamically learns task behavior. It classifies
+  tasks by wakeup frequency, context switch rate, runtime, and sleep patterns,
+  then adapts scheduling decisions in real time using a persistent process
+  database.
+
+- [**scx_horoscope**](https://github.com/zampierilucas/scx_horoscope) - An
+  astrological CPU scheduler that makes scheduling decisions based on real-time
+  planetary positions and zodiac signs. Tasks get boosted or penalized depending
+  on cosmic conditions. Built for educational and entertainment purposes.
 
 ## Getting in Touch
 
@@ -321,6 +293,8 @@ channel on `Discord` for details.
 There are articles and videos about `sched_ext`, which helps you to explore
 `sched_ext` in various ways. Following are some examples:
 
+- [2025 Linux Plumbers Conference MC](https://lpc.events/event/19/sessions/229)
+- [2024 Linux Plumbers Conference MC](https://lpc.events/event/18/sessions/192)
 - [`Sched_ext` YT playlist](https://youtube.com/playlist?list=PLLLT4NxU7U1TnhgFH6k57iKjRu6CXJ3yB&si=DETiqpfwMoj8Anvl)
 - [LWN: The extensible scheduler class (February, 2023)](https://lwn.net/Articles/922405/)
 - [arighi's blog: Implement your own kernel CPU scheduler in Ubuntu with `sched_ext` (July, 2023)](https://arighi.blogspot.com/2023/07/implement-your-own-cpu-scheduler-in.html)

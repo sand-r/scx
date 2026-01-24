@@ -11,4 +11,10 @@ tags
 *.o
 *.skel.h
 selftest
+selftest_noasan
 CLAUDE.md
+**/.claude
+**/*.ll
+**/*.s
+**/*.tmp
+.agent/

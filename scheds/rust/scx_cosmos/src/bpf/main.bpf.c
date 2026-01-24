@@ -3,6 +3,8 @@
  * Copyright (c) 2025 Andrea Righi <arighi@nvidia.com>
  */
 #include <scx/common.bpf.h>
+#include <scx/percpu.bpf.h>
+#include <lib/pmu.h>
 #include "intf.h"
 
 char _license[] SEC("license") = "GPL";
@@ -74,6 +76,11 @@ const volatile bool preferred_idle_scan = false;
 const volatile u64 preferred_cpus[MAX_CPUS];
 
 /*
+ * Cache CPU capacity values.
+ */
+const volatile u64 cpu_capacity[MAX_CPUS];
+
+/*
  * Enable cpufreq integration.
  */
 const volatile bool cpufreq_enabled = true;
@@ -96,14 +103,14 @@ const volatile bool avoid_smt = true;
 const volatile bool mm_affinity;
 
 /*
- * Enable perf-event scheduling.
+ * ID of perf-event being tracked. 0 for "no event".
  */
-const volatile bool perf_enabled;
+const volatile u64 perf_config;
 
 /*
  * Performance counter threshold to classify a task as event heavy.
  */
-const volatile u64 perf_threshold;
+volatile u64 perf_threshold;
 
 /*
  * Enable deferred wakeup.
@@ -111,10 +118,20 @@ const volatile u64 perf_threshold;
 const volatile bool deferred_wakeups = true;
 
 /*
- * Do we want to keep the tasks sticky or distribute them on being event
- * heavy
+ * Sticky perf event (0x0 = disabled). When task's count for this event
+ * exceeds perf_sticky_threshold, keep it on the same CPU.
  */
-const volatile bool perf_sticky;
+const volatile u64 perf_sticky;
+
+/*
+ * Threshold for sticky event; task is kept on same CPU when exceeded.
+ */
+volatile u64 perf_sticky_threshold;
+
+/*
+ * Enable tick-based preemption enforcement.
+ */
+const volatile bool tick_preempt = true;
 
 /*
  * Ignore synchronous wakeup events.
@@ -145,6 +162,7 @@ volatile u64 cpu_util;
  * Scheduler statistics.
  */
 volatile u64 nr_event_dispatches;
+volatile u64 nr_ev_sticky_dispatches;
 
 /*
  * Scheduler's exit status.
@@ -174,12 +192,8 @@ struct task_ctx {
 	u64 exec_runtime;
 	u64 wakeup_freq;
 	u64 last_woke_at;
-
-	/*
-	 * Per-task perf event metrics.
-	 */
 	u64 perf_events;
-	u64 perf_delta_t;
+	u64 perf_sticky_events;
 };
 
 struct {
@@ -229,6 +243,7 @@ struct cpu_ctx {
 	u64 last_update;
 	u64 perf_lvl;
 	u64 perf_events;
+	struct bpf_cpumask __kptr *smt;
 };
 
 struct {
@@ -247,73 +262,42 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
 }
 
-struct {
-	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-	__uint(key_size, sizeof(u32));
-	__uint(value_size, sizeof(int));
-	__uint(max_entries, MAX_CPUS);
-} perf_events SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(key_size, sizeof(u32));
-	__uint(value_size, sizeof(struct bpf_perf_event_value));
-	__uint(max_entries, 1);
-} start_readings SEC(".maps");
-
-static int read_perf_counter(s32 cpu, u32 counter_idx, struct bpf_perf_event_value *value)
+static void update_counters(struct task_struct *p, struct task_ctx *tctx, s32 cpu)
 {
-	u32 key = cpu + counter_idx;
-
-	return bpf_perf_event_read_value(&perf_events, key, value, sizeof(*value));
-}
-
-static void start_counters(s32 cpu)
-{
-	struct bpf_perf_event_value value;
-	struct bpf_perf_event_value *ptr;
-	u32 i;
-
-	i = 0;
-	ptr = bpf_map_lookup_elem(&start_readings, &i);
-	if (ptr) {
-		if (read_perf_counter(cpu, i, &value) == 0)
-			*ptr = value;
-		else
-			__builtin_memset(ptr, 0, sizeof(*ptr));
-	}
-}
-
-static void stop_counters(struct task_struct *p, struct task_ctx *tctx, s32 cpu)
-{
-	struct bpf_perf_event_value current, *start;
 	struct cpu_ctx *cctx;
-	u64 delta_events = 0, delta = 0;
-	u32 i = 0;
+	u64 delta = 0;
+	u64 sticky_delta = 0;
 
-	start = bpf_map_lookup_elem(&start_readings, &i);
-	if (start && start->counter != 0) {
-		if (read_perf_counter(cpu, i, &current) == 0) {
-			if (current.counter >= start->counter)
-				delta = current.counter - start->counter;
-			delta_events = delta;
-		}
+	cctx = try_lookup_cpu_ctx(cpu);
+	if (cctx)
+		cctx->perf_events += delta;
+
+	if (perf_config) {
+		scx_pmu_read(p, perf_config, &delta, true);
+		tctx->perf_events = delta;
 	}
 
-	tctx->perf_events = delta_events;
-	cctx = try_lookup_cpu_ctx(cpu);
-	if (!cctx)
-		return;
-	cctx->perf_events += delta;
-
+	if (perf_sticky) {
+		scx_pmu_read(p, perf_sticky, &sticky_delta, true);
+		tctx->perf_sticky_events = sticky_delta;
+	}
 }
 
 /*
- * Return true if the task is triggering too many PMU events.
+ * Return true if the task is triggering too many PMU events (migration event).
  */
 static inline bool is_event_heavy(const struct task_ctx *tctx)
 {
-	return tctx->perf_events > perf_threshold;
+	return perf_config && tctx->perf_events > perf_threshold;
+}
+
+/*
+ * Return true if the task exceeds the sticky event threshold and should
+ * stay on the same CPU.
+ */
+static inline bool is_sticky_event_heavy(const struct task_ctx *tctx)
+{
+	return perf_sticky && tctx->perf_sticky_events > perf_sticky_threshold;
 }
 
 /*
@@ -471,6 +455,95 @@ static inline bool is_cpu_idle(s32 cpu)
 }
 
 /*
+ * Return the SMT sibling CPU of a @cpu.
+ */
+static s32 smt_sibling(s32 cpu)
+{
+	const struct cpumask *smt;
+	struct cpu_ctx *cctx;
+
+	cctx = try_lookup_cpu_ctx(cpu);
+	if (!cctx)
+		return cpu;
+
+	smt = cast_mask(cctx->smt);
+	if (!smt)
+		return cpu;
+
+	return bpf_cpumask_first(smt);
+}
+
+/*
+ * Return true if the CPU is part of a fully busy SMT core, false
+ * otherwise.
+ *
+ * If SMT is disabled or SMT contention avoidance is disabled, always
+ * return false (since there's no SMT contention or it's ignored).
+ */
+static bool is_smt_contended(s32 cpu)
+{
+	const struct cpumask *idle_mask;
+	bool is_contended;
+
+	if (!smt_enabled)
+		return false;
+
+	/*
+	 * If the sibling SMT CPU is not idle and there are other full-idle
+	 * SMT cores available, consider the current CPU as contended.
+	 */
+	idle_mask = scx_bpf_get_idle_cpumask();
+	is_contended = !bpf_cpumask_test_cpu(smt_sibling(cpu), idle_mask) &&
+		       !bpf_cpumask_empty(idle_mask);
+	scx_bpf_put_cpumask(idle_mask);
+
+	return is_contended;
+}
+
+/*
+ * Return true if @cpu is valid, otherwise trigger an error and return
+ * false.
+ */
+static inline bool is_cpu_valid(s32 cpu)
+{
+	u64 max_cpu = MIN(nr_cpu_ids, MAX_CPUS);
+
+	if (cpu < 0 || cpu >= max_cpu) {
+		scx_bpf_error("invalid CPU id: %d", cpu);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Return true if @this_cpu and @that_cpu are in the same LLC, false
+ * otherwise.
+ */
+static inline bool cpus_share_cache(s32 this_cpu, s32 that_cpu)
+{
+	if (this_cpu == that_cpu)
+		return true;
+
+	if (!is_cpu_valid(this_cpu) || !is_cpu_valid(that_cpu))
+		return false;
+
+	return cpu_llc_id(this_cpu) == cpu_llc_id(that_cpu);
+}
+/*
+ * Return true if @this_cpu is faster than @that_cpu, false otherwise.
+ */
+static inline bool is_cpu_faster(s32 this_cpu, s32 that_cpu)
+{
+	if (this_cpu == that_cpu)
+		return false;
+
+	if (!is_cpu_valid(this_cpu) || !is_cpu_valid(that_cpu))
+		return false;
+
+	return cpu_capacity[this_cpu] > cpu_capacity[that_cpu];
+}
+
+/*
  * Try to pick the best idle CPU based on the @preferred_cpus ranking.
  * Return a full-idle SMT core if @do_idle_smt is true, or any idle CPU if
  * @do_idle_smt is false.
@@ -578,12 +651,21 @@ out:
 }
 
 /*
+ * Return true in case of a task wakeup, false otherwise.
+ */
+static inline bool is_wakeup(u64 wake_flags)
+{
+	return wake_flags & SCX_WAKE_TTWU;
+}
+
+/*
  * Pick an optimal idle CPU for task @p (as close as possible to
  * @prev_cpu).
  *
  * Return the CPU id or a negative value if an idle CPU can't be found.
  */
-static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool from_enqueue)
+static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
+			 u64 wake_flags, bool from_enqueue)
 {
 	const struct cpumask *mask = cast_mask(primary_cpumask);
 	s32 cpu;
@@ -601,6 +683,28 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	 */
 	if (no_wake_sync)
 		wake_flags &= ~SCX_WAKE_SYNC;
+
+	/*
+	 * On wakeup if the waker's CPU is faster than the wakee's CPU, try
+	 * to move the wakee closer to the waker.
+	 *
+	 * In presence of hybrid cores this helps to naturally migrate
+	 * tasks over to the faster cores.
+	 */
+	if (primary_all && is_wakeup(wake_flags) && this_cpu >= 0 &&
+	    is_cpu_faster(this_cpu, prev_cpu)) {
+		/*
+		 * If both the waker's CPU and the wakee's CPU are in the
+		 * same LLC and the wakee's CPU is a fully idle SMT core,
+		 * don't migrate.
+		 */
+		if (cpus_share_cache(this_cpu, prev_cpu) &&
+		    !is_smt_contended(prev_cpu) &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			return prev_cpu;
+
+		prev_cpu = this_cpu;
+	}
 
 	/*
 	 * Fallback to the old API if the kernel doesn't support
@@ -706,6 +810,31 @@ static int init_cpumask(struct bpf_cpumask **p_cpumask)
 	return *p_cpumask ? 0 : -ENOMEM;
 }
 
+SEC("syscall")
+int enable_sibling_cpu(struct domain_arg *input)
+{
+	struct cpu_ctx *cctx;
+	struct bpf_cpumask *mask, **pmask;
+	int err = 0;
+
+	cctx = try_lookup_cpu_ctx(input->cpu_id);
+	if (!cctx)
+		return -ENOENT;
+
+	pmask = &cctx->smt;
+	err = init_cpumask(pmask);
+	if (err)
+		return err;
+
+	bpf_rcu_read_lock();
+	mask = *pmask;
+	if (mask)
+		bpf_cpumask_set_cpu(input->sibling_cpu_id, mask);
+	bpf_rcu_read_unlock();
+
+	return err;
+}
+
 /*
  * Called from user-space to add CPUs to the the primary domain.
  */
@@ -761,52 +890,15 @@ static int wakeup_timerfn(void *map, int *key, struct bpf_timer *timer)
 }
 
 /*
- * Return true if the CPU is part of a fully busy SMT core, false
- * otherwise.
- *
- * If SMT is disabled or SMT contention avoidance is disabled, always
- * return false (since there's no SMT contention or it's ignored).
+ * Return true if the task should attempt a migration, false otherwise.
  */
-static bool is_smt_contended(s32 cpu)
-{
-	const struct cpumask *smt;
-	bool is_contended;
-
-	if (!smt_enabled || !avoid_smt)
-		return false;
-
-	smt = scx_bpf_get_idle_smtmask();
-	is_contended = bpf_cpumask_empty(smt);
-	scx_bpf_put_cpumask(smt);
-
-	return is_contended;
-}
-
-/*
- * Return true if we should attempt a task migration to an idle CPU, false
- * otherwise.
- */
-static bool need_migrate(const struct task_struct *p, s32 prev_cpu, u64 enq_flags)
+static bool task_should_migrate(struct task_struct *p, u64 enq_flags)
 {
 	/*
-	 * Per-CPU tasks are not allowed to migrate.
+	 * Attempt a migration on wakeup (task was not running) and only if
+	 * ops.select_cpu() has not been called already.
 	 */
-	if (is_pcpu_task(p))
-		return false;
-
-	/*
-	 * Always attempt to migrate if we're contending an SMT core.
-	 */
-	if (is_smt_contended(prev_cpu))
-		return true;
-
-	/*
-	 * Attempt a migration on wakeup (if ops.select_cpu() was skipped)
-	 * or if the task was re-enqueued due to a higher scheduling class
-	 * stealing the CPU it was queued on.
-	 */
-	return (!__COMPAT_is_enq_cpu_selected(enq_flags) && !scx_bpf_task_running(p)) ||
-	       (enq_flags & SCX_ENQ_REENQ);
+	return !__COMPAT_is_enq_cpu_selected(enq_flags) && !scx_bpf_task_running(p);
 }
 
 /*
@@ -825,14 +917,12 @@ is_wake_affine(const struct task_struct *waker, const struct task_struct *wakee)
  * same node as prev_cpu, otherwise this optimization becomes expensive on
  * large CPU numa systems
  */
-static int pick_least_busy_event_cpu(const struct task_struct *p, s32 prev_cpu)
+static int pick_least_busy_event_cpu(const struct task_struct *p, s32 prev_cpu,
+				     const struct task_ctx *tctx)
 {
 	struct cpu_ctx *cctx;
 	u64 min = ~0UL;
 	int cpu, ret_cpu = -EBUSY;
-
-	if (perf_sticky)
-		return prev_cpu;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu_node(cpu) != cpu_node(prev_cpu) ||
@@ -856,10 +946,18 @@ static int pick_least_busy_event_cpu(const struct task_struct *p, s32 prev_cpu)
 s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	const struct task_struct *current = (void *)bpf_get_current_task_btf();
-	struct task_ctx *tctx;
 	bool is_busy = is_system_busy();
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
+	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
 	int new_cpu;
+
+	/*
+	 * Make sure @prev_cpu is usable, otherwise try to move close to
+	 * the waker's CPU. If the waker's CPU is also not usable, then
+	 * pick the first usable CPU.
+	 */
+	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
 
 	/*
 	 * When the waker and wakee share the same address space and were previously
@@ -877,16 +975,30 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	}
 
 	/*
-	 * Pick an event free CPU?
+	 * Pick an event free CPU: if task exceeds sticky threshold, keep
+	 * on same CPU, if it exceeds migration threshold, move to least
+	 * event-busy CPU.
 	 */
-	if (perf_enabled) {
-		tctx = try_lookup_task_ctx(p);
-		if (tctx && is_event_heavy(tctx)) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
-			__sync_fetch_and_add(&nr_event_dispatches, 1);
-			new_cpu = pick_least_busy_event_cpu(p, prev_cpu);
+	if (perf_config || perf_sticky) {
+		struct task_ctx *tctx;
 
-			return new_cpu < 0 ? prev_cpu : new_cpu;
+		tctx = try_lookup_task_ctx(p);
+		if (!tctx)
+			return prev_cpu;
+
+		if (is_sticky_event_heavy(tctx)) {
+			__sync_fetch_and_add(&nr_ev_sticky_dispatches, 1);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
+			return prev_cpu;
+		}
+
+		if (is_event_heavy(tctx)) {
+			__sync_fetch_and_add(&nr_event_dispatches, 1);
+			new_cpu = pick_least_busy_event_cpu(p, prev_cpu, tctx);
+			if (new_cpu >= 0) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
+				return new_cpu;
+			}
 		}
 	}
 
@@ -898,7 +1010,8 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	 * task to ops.enqueue(). Dispatching directly from here, even if
 	 * we can't find an idle CPU, allows to save some locking overhead.
 	 */
-	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, false);
+	cpu = pick_idle_cpu(p, prev_cpu, is_this_cpu_allowed ? this_cpu : -1,
+			    wake_flags, false);
 	if (cpu >= 0 || !is_busy)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
 
@@ -919,6 +1032,37 @@ static inline void wakeup_cpu(s32 cpu)
 	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
+void BPF_STRUCT_OPS(cosmos_tick, struct task_struct *p)
+{
+	struct task_ctx *tctx;
+
+	if (!tick_preempt)
+		return;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx)
+		return;
+
+	/*
+	 * Force preemption if the task has exceeded its time slice and
+	 * either:
+	 * - SMT contention has changed since we started running
+	 *   (sibling went busy or idle), triggering rescheduling so
+	 *   select_cpu can make a better placement decision, or
+	 * - the system is busy and there are tasks waiting in the
+	 *   local or shared DSQ.
+	 */
+	if (time_delta(scx_bpf_now(), tctx->last_run_at) > task_slice(p)) {
+		s32 cpu = scx_bpf_task_cpu(p);
+		bool smt_contention = avoid_smt && is_smt_contended(cpu);
+		bool cpu_busy = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) ||
+				scx_bpf_dsq_nr_queued(shared_dsq(cpu));
+
+		if (smt_contention || (is_system_busy() && cpu_busy))
+			p->scx.slice = 0;
+	}
+}
+
 void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
@@ -934,17 +1078,30 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 
 	/*
-	 * Immediately dispatch perf event-heavy tasks to a new CPU.
+	 * Immediately dispatch sticky event-heavy tasks to the same CPU.
 	 */
-	if (perf_enabled && !is_migration_disabled(p) &&
-	    is_event_heavy(tctx)) {
-		new_cpu = pick_least_busy_event_cpu(p, prev_cpu);
+	if (is_sticky_event_heavy(tctx)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), enq_flags);
+		__sync_fetch_and_add(&nr_ev_sticky_dispatches, 1);
+
+		if (!scx_bpf_task_running(p))
+			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+		return;
+	}
+
+	/*
+	 * Immediately dispatch migration event-heavy tasks to a new CPU
+	 * (if the task is allowed to migrate).
+	 */
+	if (!is_migration_disabled(p) && is_event_heavy(tctx)) {
+		new_cpu = pick_least_busy_event_cpu(p, prev_cpu, tctx);
 		if (new_cpu >= 0) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | new_cpu, task_slice(p), 0);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | new_cpu,
+					   task_slice(p), enq_flags);
 			__sync_fetch_and_add(&nr_event_dispatches, 1);
 
 			if (new_cpu != prev_cpu || !scx_bpf_task_running(p))
-				wakeup_cpu(new_cpu);
+				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
 			return;
 		}
 	}
@@ -953,8 +1110,11 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Attempt to dispatch directly to an idle CPU if the task can
 	 * migrate.
 	 */
-	if (need_migrate(p, prev_cpu, enq_flags)) {
-		cpu = pick_idle_cpu(p, prev_cpu, 0, true);
+	if (task_should_migrate(p, enq_flags)) {
+		if (is_pcpu_task(p))
+			cpu = scx_bpf_test_and_clear_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY;
+		else
+			cpu = pick_idle_cpu(p, prev_cpu, -1, 0, true);
 		if (cpu >= 0) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(p), enq_flags);
 			if (cpu != prev_cpu || !scx_bpf_task_running(p))
@@ -964,19 +1124,22 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Keep using the same CPU if the system is not busy, otherwise
-	 * fallback to the shared DSQ.
+	 * Keep using the same CPU if the system is not busy.
 	 */
 	if (!is_system_busy()) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), enq_flags);
-		if (!__COMPAT_is_enq_cpu_selected(enq_flags) && !scx_bpf_task_running(p))
+		if (task_should_migrate(p, enq_flags))
 			wakeup_cpu(prev_cpu);
 		return;
 	}
 
+	/*
+	 * Dispatch the task to the shared DSQ.
+	 */
 	scx_bpf_dsq_insert_vtime(p, shared_dsq(prev_cpu),
 				 task_slice(p), task_dl(p, tctx), enq_flags);
-	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && !scx_bpf_task_running(p))
+
+	if (task_should_migrate(p, enq_flags))
 		wakeup_cpu(prev_cpu);
 }
 
@@ -994,18 +1157,8 @@ void BPF_STRUCT_OPS(cosmos_dispatch, s32 cpu, struct task_struct *prev)
 	 * wants to run on this SMT core, allow the previous task to run
 	 * for another time slot.
 	 */
-	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) && !is_smt_contended(cpu))
+	if (prev && (prev->scx.flags & SCX_TASK_QUEUED))
 		prev->scx.slice = task_slice(prev);
-}
-
-void BPF_STRUCT_OPS(cosmos_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
-{
-	/*
-	 * A higher scheduler class stole the CPU, re-enqueue all the tasks
-	 * that are waiting on this CPU and give them a chance to pick
-	 * another idle CPU.
-	 */
-	scx_bpf_reenqueue_local();
 }
 
 void BPF_STRUCT_OPS(cosmos_runnable, struct task_struct *p, u64 enq_flags)
@@ -1036,7 +1189,6 @@ void BPF_STRUCT_OPS(cosmos_runnable, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(cosmos_running, struct task_struct *p)
 {
-	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
 	tctx = try_lookup_task_ctx(p);
@@ -1063,8 +1215,8 @@ void BPF_STRUCT_OPS(cosmos_running, struct task_struct *p)
 	/*
 	 * Capture performance counter baseline when task starts running.
 	 */
-	if (perf_enabled)
-		start_counters(cpu);
+	if (perf_config || perf_sticky)
+		scx_pmu_event_start(p, false);
 }
 
 void BPF_STRUCT_OPS(cosmos_stopping, struct task_struct *p, bool runnable)
@@ -1078,8 +1230,10 @@ void BPF_STRUCT_OPS(cosmos_stopping, struct task_struct *p, bool runnable)
 		return;
 
 	/* Update task's performance counters */
-	if (perf_enabled)
-		stop_counters(p, tctx, cpu);
+	if (perf_config || perf_sticky) {
+		scx_pmu_event_stop(p);
+		update_counters(p, tctx, cpu);
+	}
 
 	/*
 	 * Evaluate the used time slice.
@@ -1111,13 +1265,23 @@ s32 BPF_STRUCT_OPS(cosmos_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
 	struct task_ctx *tctx;
+	int ret;
 
 	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
 		return -ENOMEM;
 
+	if ((ret = scx_pmu_task_init(p)))
+		return ret;
+
 	return 0;
+}
+
+void BPF_STRUCT_OPS(cosmos_exit_task, struct task_struct *p,
+		   struct scx_exit_task_args *args)
+{
+	scx_pmu_task_fini(p);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(cosmos_init)
@@ -1176,11 +1340,29 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cosmos_init)
 		cctx->perf_events = 0;
 	}
 
+	if (perf_config) {
+		err = scx_pmu_install(perf_config);
+		if (err)
+			return err;
+	}
+
+	if (perf_sticky) {
+		err = scx_pmu_install(perf_sticky);
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
 void BPF_STRUCT_OPS(cosmos_exit, struct scx_exit_info *ei)
 {
+	if (perf_config)
+		scx_pmu_uninstall(perf_config);
+
+	if (perf_sticky)
+		scx_pmu_uninstall(perf_sticky);
+
 	UEI_RECORD(uei, ei);
 }
 
@@ -1188,12 +1370,13 @@ SCX_OPS_DEFINE(cosmos_ops,
 	       .select_cpu		= (void *)cosmos_select_cpu,
 	       .enqueue			= (void *)cosmos_enqueue,
 	       .dispatch		= (void *)cosmos_dispatch,
+	       .tick                    = (void *)cosmos_tick,
 	       .runnable		= (void *)cosmos_runnable,
 	       .running			= (void *)cosmos_running,
 	       .stopping		= (void *)cosmos_stopping,
-	       .cpu_release		= (void *)cosmos_cpu_release,
 	       .enable			= (void *)cosmos_enable,
 	       .init_task		= (void *)cosmos_init_task,
+	       .exit_task		= (void *)cosmos_exit_task,
 	       .init			= (void *)cosmos_init,
 	       .exit			= (void *)cosmos_exit,
 	       .timeout_ms		= 5000,
