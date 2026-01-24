@@ -79,7 +79,7 @@ const volatile bool rr_sched;
  * (cpu_capacity / cpu_energy_cost) to rank idle CPUs and will prefer the
  * most energy-efficient CPU within the candidate set.
  */
-const volatile bool energy_aware;
+volatile bool energy_aware;
 
 /* Primary domain includes all CPU */
 /*
@@ -1154,12 +1154,14 @@ static s32 pick_idle_cpu_builtin(struct task_struct *p, const struct task_ctx *t
 
 	/*
 	 * Default to picking an idle CPU in the primary (typically energy)
-	 * domain. Use the perf domain only as an escape hatch.
+	 * domain. Use the perf domain as an escape hatch when primary is
+	 * saturated. Interactive tasks try perf first; all other tasks
+	 * try perf as a fallback after primary.
 	 */
-	if (allow_non_primary && is_interactive(p, tctx))
+	if (allow_non_primary)
 		perf = cast_mask(perf_cpumask);
 
-	if (perf && prefer_perf_for_interactive) {
+	if (perf && is_interactive(p, tctx) && prefer_perf_for_interactive) {
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, perf, 0);
 		if (cpu >= 0)
 			__sync_fetch_and_add(&nr_idle_perf_picks, 1);
@@ -2128,8 +2130,10 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 * In performance profile, boost big-core cpuperf requests to reach higher
 	 * frequencies sooner. Some workloads (e.g. frame-based rendering) are
 	 * frequency-sensitive even at moderate utilization.
+	 *
+	 * Skip this when cpufreq control is disabled (e.g., intel_pstate active).
 	 */
-	if (aggressive_cpuperf) {
+	if (cpufreq_perf_lvl == -1 && aggressive_cpuperf) {
 		const struct cpumask *perf = cast_mask(perf_cpumask);
 
 		if (perf && bpf_cpumask_test_cpu(cpu, perf))
@@ -2315,13 +2319,17 @@ void BPF_STRUCT_OPS(ext_quiescent, struct task_struct *p, u64 deq_flags)
 
 	/*
 	 * Refresh the average rate of voluntary context switches.
+	 *
+	 * Throttle updates to reduce overhead for high-frequency sleepers
+	 * (e.g., GPU-bound workloads). Only recalculate if at least 1ms
+	 * has passed since the last update.
 	 */
 	delta_t = time_delta(now, tctx->last_sleep_at);
-	if (delta_t > 0) {
-	    u64 nvcsw = slice_max / delta_t;
+	if (delta_t >= NSEC_PER_MSEC) {
+		u64 nvcsw = slice_max / delta_t;
 
-	    tctx->avg_nvcsw = calc_avg_clamp(tctx->avg_nvcsw, nvcsw, 0, max_avg_nvcsw);
-	    tctx->last_sleep_at = now;
+		tctx->avg_nvcsw = calc_avg_clamp(tctx->avg_nvcsw, nvcsw, 0, max_avg_nvcsw);
+		tctx->last_sleep_at = now;
 	}
 }
 

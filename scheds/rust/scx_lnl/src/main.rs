@@ -603,7 +603,6 @@ impl<'a> Scheduler<'a> {
         rodata.native_priority = opts.native_priority;
         rodata.slice_lag_scaling = opts.slice_lag_scaling;
         rodata.builtin_idle = !opts.no_builtin_idle;
-        rodata.energy_aware = !opts.no_energy_aware;
         rodata.slice_max = opts.slice_us * 1000;
         rodata.slice_min = opts.slice_us_min * 1000;
         rodata.slice_lag = opts.slice_us_lag * 1000;
@@ -623,6 +622,8 @@ impl<'a> Scheduler<'a> {
         bss.prefer_perf_for_interactive = perf_profile && auto_domain;
         bss.aggressive_overflow = perf_profile && auto_domain;
         bss.aggressive_cpuperf = perf_profile && auto_domain;
+        // Disable energy-aware scheduling in performance mode - we want max throughput, not efficiency.
+        bss.energy_aware = !opts.no_energy_aware && !perf_profile;
         rodata.interactive_boost_perf_lvl = opts.interactive_boost_lvl.min(1024);
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
@@ -961,6 +962,8 @@ impl<'a> Scheduler<'a> {
             bss.prefer_perf_for_interactive = perf_profile && auto_domain;
             bss.aggressive_overflow = perf_profile && auto_domain;
             bss.aggressive_cpuperf = perf_profile && auto_domain;
+            // Disable energy-aware scheduling in performance mode.
+            bss.energy_aware = !self.opts.no_energy_aware && !perf_profile;
         }
 
         if auto_domain {
