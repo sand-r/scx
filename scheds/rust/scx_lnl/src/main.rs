@@ -872,8 +872,11 @@ impl<'a> Scheduler<'a> {
             bss.cpu_capacity[cpu.id] = cpu.cpu_capacity as u16;
             bss.cpu_is_big[cpu.id] = matches!(cpu.core_type, CoreType::Big { .. }) as u8;
             bss.cpu_energy_cost[cpu.id] = 1024;
+            bss.cpu_energy_cost_mid[cpu.id] = 1024;
             bss.cpu_energy_cost_hi[cpu.id] = 1024;
-            bss.cpu_energy_perf_thresh[cpu.id] = (cpu.cpu_capacity / 2).clamp(1, 1024) as u16;
+            bss.cpu_energy_perf_thresh[cpu.id] = (cpu.cpu_capacity / 3).clamp(1, 1024) as u16;
+            bss.cpu_energy_perf_thresh_hi[cpu.id] =
+                ((cpu.cpu_capacity * 2) / 3).clamp(1, 1024) as u16;
         }
 
         let em = match EnergyModel::new() {
@@ -889,9 +892,6 @@ impl<'a> Scheduler<'a> {
                 continue;
             };
             let states: Vec<_> = pd.perf_table.values().collect();
-            let Some(first) = states.first() else {
-                continue;
-            };
             let Some(last) = states.last() else {
                 continue;
             };
@@ -909,18 +909,21 @@ impl<'a> Scheduler<'a> {
                     .clamp(1, u16::MAX as u32) as u16
             };
 
-            let max_perf = last.performance.clamp(1, 1024);
-            let mid_perf = max_perf.div_ceil(2);
-            let thresh_perf = states
-                .iter()
-                .find(|ps| ps.performance >= mid_perf)
-                .map(|ps| ps.performance)
-                .unwrap_or(max_perf)
-                .clamp(1, 1024) as u16;
+            let low_ps = pd.select_perf_state(33.0).unwrap_or(last);
+            let mid_ps = pd.select_perf_state(66.0).unwrap_or(last);
+            let high_ps = last;
 
-            bss.cpu_energy_cost[cpu.id] = scale_cost(first.cost);
-            bss.cpu_energy_cost_hi[cpu.id] = scale_cost(last.cost);
-            bss.cpu_energy_perf_thresh[cpu.id] = thresh_perf;
+            let low_thresh = low_ps.performance.clamp(1, 1024) as u16;
+            let mut high_thresh = mid_ps.performance.clamp(1, 1024) as u16;
+            if high_thresh < low_thresh {
+                high_thresh = low_thresh;
+            }
+
+            bss.cpu_energy_cost[cpu.id] = scale_cost(low_ps.cost);
+            bss.cpu_energy_cost_mid[cpu.id] = scale_cost(mid_ps.cost);
+            bss.cpu_energy_cost_hi[cpu.id] = scale_cost(high_ps.cost);
+            bss.cpu_energy_perf_thresh[cpu.id] = low_thresh;
+            bss.cpu_energy_perf_thresh_hi[cpu.id] = high_thresh;
         }
 
         Ok(())

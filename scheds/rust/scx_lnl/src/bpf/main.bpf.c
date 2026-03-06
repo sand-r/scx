@@ -329,21 +329,25 @@ private(EXT) struct bpf_cpumask __kptr *perf_cpumask;
  *
  * cpu_capacity: relative capacity (0-1024)
  * cpu_energy_cost: low-util cost coefficient (lower is more efficient)
+ * cpu_energy_cost_mid: mid-util cost coefficient
  * cpu_energy_cost_hi: high-util cost coefficient
- * cpu_energy_perf_thresh: util threshold used to switch to the high-util cost
+ * cpu_energy_perf_thresh: util threshold used to switch low -> mid
+ * cpu_energy_perf_thresh_hi: util threshold used to switch mid -> high
  * cpu_is_big: 1 for big/P-cores, 0 otherwise
  */
 u16 cpu_capacity[NR_CPUS];
 u16 cpu_energy_cost[NR_CPUS];
+u16 cpu_energy_cost_mid[NR_CPUS];
 u16 cpu_energy_cost_hi[NR_CPUS];
 u16 cpu_energy_perf_thresh[NR_CPUS];
+u16 cpu_energy_perf_thresh_hi[NR_CPUS];
 u8 cpu_is_big[NR_CPUS];
 
 /*
  * Energy model helpers.
  *
  * cpu_capacity: relative capacity (0-1024), higher means faster
- * cpu_energy_cost: normalized low-util cost coefficient (lower is more efficient)
+ * cpu_energy_cost*: normalized EM-derived cost coefficients
  */
 static __always_inline u32 get_cpu_capacity(s32 cpu)
 {
@@ -363,24 +367,34 @@ static __always_inline u32 get_cpu_energy_cost(s32 cpu)
  * Return a util-dependent EM cost for @cpu.
  *
  * This is a simplified, verifier-friendly approximation of EAS. User space
- * precomputes two EM cost bins per CPU (low/high util) and a threshold that
- * selects between them.
+ * precomputes three EM cost bins per CPU (low/mid/high util) and two
+ * thresholds that select between them.
  */
 static __always_inline u32 get_cpu_em_cost_for_util(s32 cpu, u32 util)
 {
-	u32 low, high, thresh;
+	u32 low, mid, high, thresh, thresh_hi;
 
 	if (cpu < 0 || cpu >= NR_CPUS)
 		return 1024;
 
 	low = get_cpu_energy_cost(cpu);
+	mid = cpu_energy_cost_mid[cpu] ? cpu_energy_cost_mid[cpu] : low;
 	high = cpu_energy_cost_hi[cpu] ? cpu_energy_cost_hi[cpu] : low;
 	thresh = cpu_energy_perf_thresh[cpu];
+	thresh_hi = cpu_energy_perf_thresh_hi[cpu];
 	if (!thresh)
-		thresh = MAX(get_cpu_capacity(cpu) / 2, 1);
+		thresh = MAX(get_cpu_capacity(cpu) / 3, 1);
+	if (!thresh_hi)
+		thresh_hi = MAX((get_cpu_capacity(cpu) * 2) / 3, thresh);
+	if (thresh_hi < thresh)
+		thresh_hi = thresh;
 	util = CLAMP(util, 1, SCX_CPUPERF_ONE);
 
-	return util <= thresh ? low : high;
+	if (util <= thresh)
+		return low;
+	if (util <= thresh_hi)
+		return mid;
+	return high;
 }
 
 /*
@@ -546,6 +560,28 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 {
 	const u32 idx = 0;
 	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
+}
+
+/*
+ * Return a smoothed estimate of CPU load in capacity units.
+ *
+ * This projects the CPU's recent utilization into the same capacity scale used
+ * by task util and the EM performance thresholds, which lets the wakeup path
+ * reason about the projected post-placement load without walking full EM
+ * curves.
+ */
+static __always_inline u32 get_cpu_load_est(s32 cpu)
+{
+	const struct cpu_ctx *cctx;
+	u64 cap, load;
+
+	cctx = try_lookup_cpu_ctx(cpu);
+	if (!cctx)
+		return 0;
+
+	cap = get_cpu_capacity(cpu);
+	load = cctx->perf_lvl * cap / SCX_CPUPERF_ONE;
+	return MIN(load, cap);
 }
 
 /*
@@ -759,8 +795,7 @@ s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int node, u64 
 	const struct cpumask *idle;
 	bool full_idle = flags & SCX_PICK_IDLE_CORE;
 	s32 cpu, best_cpu = -1;
-	s32 best_fits = -1;
-	u32 best_cost = 0;
+	u32 best_rank = 0;
 
 	if (!cpus_allowed)
 		return -ENOENT;
@@ -776,8 +811,8 @@ s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int node, u64 
 		return -ENOENT;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
-		u32 cap, cost;
-		s32 fits;
+		u32 cap, load, projected, overload, cost, rank;
+		bool fits;
 
 		if (!bpf_cpumask_test_cpu(cpu, cpus_allowed))
 			continue;
@@ -785,20 +820,33 @@ s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int node, u64 
 			continue;
 
 		cap = get_cpu_capacity(cpu);
-		cost = get_cpu_em_cost_for_util(cpu, task_util);
+		load = get_cpu_load_est(cpu);
+		projected = MIN(load + task_util, SCX_CPUPERF_ONE);
+		cost = get_cpu_em_cost_for_util(cpu, projected);
 
 		/*
-		 * EAS-like fit check: prefer CPUs with enough spare capacity for
-		 * the task util estimate before comparing projected costs.
+		 * EAS-like fit check: prefer CPUs that can accommodate the
+		 * projected post-placement load. Among non-fitting candidates,
+		 * prefer the smallest overload before comparing EM costs.
 		 */
-		fits = cap >= task_util;
+		fits = projected <= cap;
+		overload = fits ? 0 : projected - cap;
 
-		if (best_cpu < 0 || fits > best_fits ||
-		    (fits == best_fits && cost < best_cost) ||
-		    (fits == best_fits && cost == best_cost && cpu == prev_cpu)) {
+		/*
+		 * Pack the lexicographic ordering into a single rank to keep the
+		 * verifier state space small:
+		 *   1. fitting CPUs rank ahead of non-fitting CPUs
+		 *   2. among non-fitting CPUs, smaller overload ranks first
+		 *   3. lower projected EM cost wins within the same class
+		 */
+		rank = fits ? cost :
+			      (1U << 31) | (MIN(overload, 0x7fffU) << 16) |
+				      MIN(cost, 0xffffU);
+
+		if (best_cpu < 0 || rank < best_rank ||
+		    (rank == best_rank && cpu == prev_cpu)) {
 			best_cpu = cpu;
-			best_fits = fits;
-			best_cost = cost;
+			best_rank = rank;
 		}
 	}
 
