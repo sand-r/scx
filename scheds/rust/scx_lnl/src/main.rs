@@ -476,14 +476,16 @@ impl<'a> Scheduler<'a> {
     }
 
     fn detect_cpufreq_enabled() -> bool {
-        let governor = Self::read_sysfs_trim("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor");
+        let governor =
+            Self::read_sysfs_trim("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor");
         if governor.as_deref() != Some("schedutil") {
             return false;
         }
 
         // If intel_pstate is active, don't try to drive cpuperf from sched_ext; the hardware
         // governor owns frequency selection in that mode.
-        let intel_pstate_status = Self::read_sysfs_trim("/sys/devices/system/cpu/intel_pstate/status");
+        let intel_pstate_status =
+            Self::read_sysfs_trim("/sys/devices/system/cpu/intel_pstate/status");
         if intel_pstate_status.as_deref() == Some("active") {
             return false;
         }
@@ -690,7 +692,10 @@ impl<'a> Scheduler<'a> {
             true
         } else {
             let enabled = Self::detect_cpufreq_enabled();
-            info!("cpufreq control: auto ({})", if enabled { "on" } else { "off" });
+            info!(
+                "cpufreq control: auto ({})",
+                if enabled { "on" } else { "off" }
+            );
             enabled
         };
 
@@ -867,6 +872,8 @@ impl<'a> Scheduler<'a> {
             bss.cpu_capacity[cpu.id] = cpu.cpu_capacity as u16;
             bss.cpu_is_big[cpu.id] = matches!(cpu.core_type, CoreType::Big { .. }) as u8;
             bss.cpu_energy_cost[cpu.id] = 1024;
+            bss.cpu_energy_cost_hi[cpu.id] = 1024;
+            bss.cpu_energy_perf_thresh[cpu.id] = (cpu.cpu_capacity / 2).clamp(1, 1024) as u16;
         }
 
         let em = match EnergyModel::new() {
@@ -881,21 +888,39 @@ impl<'a> Scheduler<'a> {
             let Some(pd) = em.get_pd_by_cpu_id(cpu.id) else {
                 continue;
             };
-            let Some((_, ps)) = pd.perf_table.last_key_value() else {
+            let states: Vec<_> = pd.perf_table.values().collect();
+            let Some(first) = states.first() else {
                 continue;
             };
-
-            let perf = ps.performance.max(1);
-            let mut cost = (ps.power.saturating_mul(1024) / perf).min(u16::MAX as usize) as u32;
+            let Some(last) = states.last() else {
+                continue;
+            };
 
             let pct = if matches!(cpu.core_type, CoreType::Big { .. }) {
                 big_cost_pct
             } else {
                 little_cost_pct
             };
-            cost = cost.saturating_mul(pct).saturating_div(100).min(u16::MAX as u32);
 
-            bss.cpu_energy_cost[cpu.id] = cost as u16;
+            let scale_cost = |cost: usize| -> u16 {
+                let cost = cost.max(1).min(u16::MAX as usize) as u32;
+                cost.saturating_mul(pct)
+                    .saturating_div(100)
+                    .clamp(1, u16::MAX as u32) as u16
+            };
+
+            let max_perf = last.performance.clamp(1, 1024);
+            let mid_perf = max_perf.div_ceil(2);
+            let thresh_perf = states
+                .iter()
+                .find(|ps| ps.performance >= mid_perf)
+                .map(|ps| ps.performance)
+                .unwrap_or(max_perf)
+                .clamp(1, 1024) as u16;
+
+            bss.cpu_energy_cost[cpu.id] = scale_cost(first.cost);
+            bss.cpu_energy_cost_hi[cpu.id] = scale_cost(last.cost);
+            bss.cpu_energy_perf_thresh[cpu.id] = thresh_perf;
         }
 
         Ok(())

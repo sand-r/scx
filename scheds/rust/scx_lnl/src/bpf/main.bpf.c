@@ -55,7 +55,6 @@ static inline u64 tick_interval_ns(void)
  * reduce cpuperf_set() churn.
  */
 #define CPUFREQ_DECR_MIN_NS	(5ULL * NSEC_PER_MSEC)
-
 const volatile u64 __COMPAT_SCX_PICK_IDLE_IN_NODE;
 
 char _license[] SEC("license") = "GPL";
@@ -326,22 +325,25 @@ private(EXT) struct bpf_cpumask __kptr *primary_cpumask;
 private(EXT) struct bpf_cpumask __kptr *perf_cpumask;
 
 /*
- * Energy model inputs, populated by user space. Used to make the behavior
- * stable across kernel energy model changes (we can bias/scale there).
+ * Energy model inputs, populated by user space.
  *
  * cpu_capacity: relative capacity (0-1024)
- * cpu_energy_cost: higher means less efficient
+ * cpu_energy_cost: low-util cost coefficient (lower is more efficient)
+ * cpu_energy_cost_hi: high-util cost coefficient
+ * cpu_energy_perf_thresh: util threshold used to switch to the high-util cost
  * cpu_is_big: 1 for big/P-cores, 0 otherwise
  */
 u16 cpu_capacity[NR_CPUS];
 u16 cpu_energy_cost[NR_CPUS];
+u16 cpu_energy_cost_hi[NR_CPUS];
+u16 cpu_energy_perf_thresh[NR_CPUS];
 u8 cpu_is_big[NR_CPUS];
 
 /*
  * Energy model helpers.
  *
  * cpu_capacity: relative capacity (0-1024), higher means faster
- * cpu_energy_cost: normalized cost coefficient (lower is more efficient)
+ * cpu_energy_cost: normalized low-util cost coefficient (lower is more efficient)
  */
 static __always_inline u32 get_cpu_capacity(s32 cpu)
 {
@@ -358,17 +360,44 @@ static __always_inline u32 get_cpu_energy_cost(s32 cpu)
 }
 
 /*
- * Compute an efficiency score for a CPU (higher is better).
+ * Return a util-dependent EM cost for @cpu.
  *
- * The score is proportional to performance-per-watt using the energy model
- * coefficients provided by user space.
+ * This is a simplified, verifier-friendly approximation of EAS. User space
+ * precomputes two EM cost bins per CPU (low/high util) and a threshold that
+ * selects between them.
  */
-static __always_inline u64 cpu_efficiency_score(s32 cpu)
+static __always_inline u32 get_cpu_em_cost_for_util(s32 cpu, u32 util)
 {
-	u64 cap = get_cpu_capacity(cpu);
-	u64 cost = MAX(get_cpu_energy_cost(cpu), 1);
+	u32 low, high, thresh;
 
-	return (cap * 1024) / cost;
+	if (cpu < 0 || cpu >= NR_CPUS)
+		return 1024;
+
+	low = get_cpu_energy_cost(cpu);
+	high = cpu_energy_cost_hi[cpu] ? cpu_energy_cost_hi[cpu] : low;
+	thresh = cpu_energy_perf_thresh[cpu];
+	if (!thresh)
+		thresh = MAX(get_cpu_capacity(cpu) / 2, 1);
+	util = CLAMP(util, 1, SCX_CPUPERF_ONE);
+
+	return util <= thresh ? low : high;
+}
+
+/*
+ * Return the current effective capacity of @cpu, accounting for base capacity
+ * and current frequency.
+ */
+static __always_inline u32 get_cpu_eff_cap(s32 cpu)
+{
+	u64 cap, freq, eff;
+
+	cap = get_cpu_capacity(cpu);
+	freq = scx_bpf_cpuperf_cur(cpu);
+	if (freq == 0)
+		freq = SCX_CPUPERF_ONE;
+
+	eff = cap * freq / SCX_CPUPERF_ONE;
+	return CLAMP(eff, 1, SCX_CPUPERF_ONE);
 }
 
 /*
@@ -624,6 +653,30 @@ static inline bool is_interactive(const struct task_struct *p, const struct task
 	return tctx->avg_nvcsw >= interactive_nvcsw_thresh;
 }
 
+static __always_inline u32 task_util_estimate(const struct task_struct *p,
+					      const struct task_ctx *tctx)
+{
+	u64 util, util_est;
+
+	/*
+	 * EAS-like util estimate based on scheduler's PELT tracking.
+	 */
+	util = READ_ONCE(p->se.avg.util_avg);
+	util_est = READ_ONCE(p->se.avg.util_est);
+	if (util_est > util)
+		util = util_est;
+
+	/*
+	 * New/forked tasks can have util=0. Use a conservative fallback and a
+	 * slightly higher floor for interactive tasks.
+	 */
+	if (!util)
+		util = is_interactive(p, tctx) ? (SCX_CPUPERF_ONE / 2) :
+						 (SCX_CPUPERF_ONE / 8);
+
+	return CLAMP(util, 1, SCX_CPUPERF_ONE);
+}
+
 /*
  * Return true if @p can only run on a single CPU, false otherwise.
  */
@@ -699,13 +752,14 @@ static const struct cpumask *get_idle_mask_flags(int node, u64 flags, bool full_
  * Returns a CPU with its idle state claimed via scx_bpf_test_and_clear_cpu_idle(),
  * or -ENOENT if no suitable CPU is found.
  */
-static s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int node, u64 flags,
-				     s32 prev_cpu)
+static __noinline
+s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int node, u64 flags,
+			      s32 prev_cpu, u32 task_util)
 {
 	const struct cpumask *idle;
 	bool full_idle = flags & SCX_PICK_IDLE_CORE;
 	s32 cpu, best_cpu = -1;
-	u64 best_score = 0;
+	s32 best_fits = -1;
 	u32 best_cost = 0;
 
 	if (!cpus_allowed)
@@ -722,22 +776,28 @@ static s32 pick_idle_cpu_node_energy(const struct cpumask *cpus_allowed, int nod
 		return -ENOENT;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
-		u64 score;
-		u32 cost;
+		u32 cap, cost;
+		s32 fits;
 
 		if (!bpf_cpumask_test_cpu(cpu, cpus_allowed))
 			continue;
 		if (!bpf_cpumask_test_cpu(cpu, idle))
 			continue;
 
-		score = cpu_efficiency_score(cpu);
-		cost = get_cpu_energy_cost(cpu);
+		cap = get_cpu_capacity(cpu);
+		cost = get_cpu_em_cost_for_util(cpu, task_util);
 
-		if (best_cpu < 0 || score > best_score ||
-		    (score == best_score && cost < best_cost) ||
-		    (score == best_score && cost == best_cost && cpu == prev_cpu)) {
+		/*
+		 * EAS-like fit check: prefer CPUs with enough spare capacity for
+		 * the task util estimate before comparing projected costs.
+		 */
+		fits = cap >= task_util;
+
+		if (best_cpu < 0 || fits > best_fits ||
+		    (fits == best_fits && cost < best_cost) ||
+		    (fits == best_fits && cost == best_cost && cpu == prev_cpu)) {
 			best_cpu = cpu;
-			best_score = score;
+			best_fits = fits;
 			best_cost = cost;
 		}
 	}
@@ -1215,6 +1275,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	const struct cpumask *primary, *p_mask, *l2_mask, *l3_mask;
 	int node;
 	s32 this_cpu = bpf_get_smp_processor_id(), cpu;
+	u32 task_util = 0;
 	bool is_prev_allowed;
 	bool allow_non_primary;
 
@@ -1235,6 +1296,8 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 */
 	if (!tctx)
 		return -ENOENT;
+
+	task_util = task_util_estimate(p, tctx);
 
 	/*
 	 * Get the task's primary scheduling domain.
@@ -1349,15 +1412,14 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		/*
 		 * Search for any full-idle CPU in the primary domain that
 		 * shares the same L2 cache.
+		 *
+		 * Within the same local cache domain, preserve locality and keep
+		 * the picker simple; energy-aware ranking is more useful once we
+		 * widen the search beyond the local cache.
 		 */
 		if (l2_mask) {
-			if (energy_aware)
-				cpu = pick_idle_cpu_node_energy(l2_mask, node,
-								SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE,
-								prev_cpu);
-			else
-				cpu = pick_idle_cpu_node(l2_mask, node,
-							 SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
+			cpu = pick_idle_cpu_node(l2_mask, node,
+						 SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
@@ -1369,13 +1431,8 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		 * shares the same L3 cache.
 		 */
 		if (l3_mask) {
-			if (energy_aware)
-				cpu = pick_idle_cpu_node_energy(l3_mask, node,
-								SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE,
-								prev_cpu);
-			else
-				cpu = pick_idle_cpu_node(l3_mask, node,
-							 SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
+			cpu = pick_idle_cpu_node(l3_mask, node,
+						 SCX_PICK_IDLE_CORE | __COMPAT_SCX_PICK_IDLE_IN_NODE);
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
@@ -1395,7 +1452,8 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 				flags |= __COMPAT_SCX_PICK_IDLE_IN_NODE;
 
 			if (energy_aware)
-				cpu = pick_idle_cpu_node_energy(p_mask, node, flags, prev_cpu);
+				cpu = pick_idle_cpu_node_energy(p_mask, node, flags,
+								prev_cpu, task_util);
 			else
 				cpu = pick_idle_cpu_node(p_mask, node, flags);
 			if (cpu >= 0) {
@@ -1410,7 +1468,8 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 		if (allow_non_primary && !primary_all) {
 			if (energy_aware)
 				cpu = pick_idle_cpu_node_energy(p->cpus_ptr, node,
-								SCX_PICK_IDLE_CORE, prev_cpu);
+								SCX_PICK_IDLE_CORE, prev_cpu,
+								task_util);
 			else
 				cpu = pick_idle_cpu_node(p->cpus_ptr, node,
 							 SCX_PICK_IDLE_CORE);
@@ -1437,11 +1496,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 * L2 cache.
 	 */
 	if (l2_mask && !node_rebalance(node)) {
-		if (energy_aware)
-			cpu = pick_idle_cpu_node_energy(l2_mask, node,
-							__COMPAT_SCX_PICK_IDLE_IN_NODE, prev_cpu);
-		else
-			cpu = pick_idle_cpu_node(l2_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
+		cpu = pick_idle_cpu_node(l2_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -1453,11 +1508,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 * L3 cache.
 	 */
 	if (l3_mask && !node_rebalance(node)) {
-		if (energy_aware)
-			cpu = pick_idle_cpu_node_energy(l3_mask, node,
-							__COMPAT_SCX_PICK_IDLE_IN_NODE, prev_cpu);
-		else
-			cpu = pick_idle_cpu_node(l3_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
+		cpu = pick_idle_cpu_node(l3_mask, node, __COMPAT_SCX_PICK_IDLE_IN_NODE);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -1469,7 +1520,8 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 */
 	if (p_mask) {
 		if (energy_aware)
-			cpu = pick_idle_cpu_node_energy(p_mask, node, 0, prev_cpu);
+			cpu = pick_idle_cpu_node_energy(p_mask, node, 0, prev_cpu,
+							task_util);
 		else
 			cpu = pick_idle_cpu_node(p_mask, node, 0);
 		if (cpu >= 0) {
@@ -1483,7 +1535,8 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx,
 	 */
 	if (allow_non_primary && !primary_all) {
 		if (energy_aware)
-			cpu = pick_idle_cpu_node_energy(p->cpus_ptr, node, 0, prev_cpu);
+			cpu = pick_idle_cpu_node_energy(p->cpus_ptr, node, 0,
+							prev_cpu, task_util);
 		else
 			cpu = pick_idle_cpu_node(p->cpus_ptr, node, 0);
 		if (cpu >= 0) {
@@ -2125,6 +2178,17 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 */
 	delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
 	perf_lvl = MIN(delta_runtime * SCX_CPUPERF_ONE / delta_t, SCX_CPUPERF_ONE);
+
+	/*
+	 * Normalize utilization by effective CPU capacity when using
+	 * dynamic cpufreq control (schedutil). This makes the utilization
+	 * signal more stable across frequency changes and core types.
+	 */
+	if (cpufreq_perf_lvl == -1) {
+		u64 eff_cap = get_cpu_eff_cap(cpu);
+
+		perf_lvl = MIN(perf_lvl * SCX_CPUPERF_ONE / eff_cap, SCX_CPUPERF_ONE);
+	}
 
 	/*
 	 * In performance profile, boost big-core cpuperf requests to reach higher
