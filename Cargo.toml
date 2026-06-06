@@ -17,6 +17,7 @@ members = [
     "scheds/rust/scx_flash",
     "scheds/rust/scx_lavd",
     "scheds/rust/scx_layered",
+    "scheds/rust/scx_lnl",
     "scheds/rust/scx_mitosis",
     "scheds/rust/scx_p2dq",
     "scheds/rust/scx_pandemonium",
