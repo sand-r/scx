@@ -764,12 +764,17 @@ void BPF_STRUCT_OPS(lnl_dispatch, s32 cpu, struct task_struct *prev)
 		u64 q_vtime = q ? q->scx.dsq_vtime : ULLONG_MAX;
 
 		if (tctx) {
-			u64 slice = bpf_ktime_get_ns() - tctx->last_run_at;
+			/*
+			 * scx_bpf_now() may return a cached rq clock, which can
+			 * be older than the timestamp recorded in ops.running():
+			 * clamp to avoid wrapping the unsigned subtraction.
+			 */
+			u64 slice = time_delta(scx_bpf_now(), tctx->last_run_at);
 			u64 prev_vtime = prev->scx.dsq_vtime +
 					 scale_by_weight_inverse(prev, slice);
 
 			if (prev_vtime < q_vtime) {
-				prev->scx.slice = task_slice(prev);
+				scx_bpf_task_set_slice(prev, task_slice(prev));
 				return;
 			}
 		}
@@ -784,7 +789,7 @@ void BPF_STRUCT_OPS(lnl_dispatch, s32 cpu, struct task_struct *prev)
 	 * round on the same CPU.
 	 */
 	if (need_running)
-		prev->scx.slice = task_slice(prev);
+		scx_bpf_task_set_slice(prev, task_slice(prev));
 }
 
 /*
@@ -819,7 +824,7 @@ static u64 update_freq(u64 freq, u64 interval)
  */
 static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now();
 	s32 cpu = scx_bpf_task_cpu(p);
 	u64 perf_lvl, delta_runtime, delta_t;
 	struct cpu_ctx *cctx;
@@ -885,7 +890,7 @@ void BPF_STRUCT_OPS(lnl_running, struct task_struct *p)
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
-	tctx->last_run_at = bpf_ktime_get_ns();
+	tctx->last_run_at = scx_bpf_now();
 
 	/*
 	 * Adjust target CPU frequency before the task starts to run.
@@ -907,7 +912,7 @@ void BPF_STRUCT_OPS(lnl_running, struct task_struct *p)
  */
 void BPF_STRUCT_OPS(lnl_stopping, struct task_struct *p, bool runnable)
 {
-	u64 now = bpf_ktime_get_ns(), slice;
+	u64 now = scx_bpf_now(), slice;
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
@@ -921,7 +926,7 @@ void BPF_STRUCT_OPS(lnl_stopping, struct task_struct *p, bool runnable)
 		/*
 		 * Evaluate the time slice used by the task.
 		 */
-		slice = MAX(now - tctx->last_run_at, 1);
+		slice = MAX(time_delta(now, tctx->last_run_at), 1);
 
 		if (tctx->slice_ns_ewma)
 			tctx->slice_ns_ewma = calc_avg(tctx->slice_ns_ewma, slice);
@@ -931,7 +936,8 @@ void BPF_STRUCT_OPS(lnl_stopping, struct task_struct *p, bool runnable)
 		/*
 		 * Update task's vruntime and accumulated runtime.
 		 */
-		p->scx.dsq_vtime += scale_by_weight_inverse(p, slice);
+		scx_bpf_task_set_dsq_vtime(p, p->scx.dsq_vtime +
+					   scale_by_weight_inverse(p, slice));
 	}
 
 	/*
@@ -948,7 +954,7 @@ void BPF_STRUCT_OPS(lnl_stopping, struct task_struct *p, bool runnable)
 
 void BPF_STRUCT_OPS(lnl_runnable, struct task_struct *p, u64 enq_flags)
 {
-	u64 now = bpf_ktime_get_ns(), delta_t;
+	u64 now = scx_bpf_now(), delta_t;
 	struct task_ctx *tctx;
 
 	if (rr_sched)
@@ -974,7 +980,7 @@ void BPF_STRUCT_OPS(lnl_enable, struct task_struct *p)
 	if (rr_sched)
 		return;
 
-	p->scx.dsq_vtime = vtime_now;
+	scx_bpf_task_set_dsq_vtime(p, vtime_now);
 }
 
 s32 BPF_STRUCT_OPS(lnl_cgroup_init, struct cgroup *cgrp,
@@ -1253,10 +1259,15 @@ static int tickless_timerfn(void *map, int *key, struct bpf_timer *timer)
 		 */
 		tctx = try_lookup_task_ctx(p);
 		if (tctx) {
-			u64 slice = bpf_ktime_get_ns() - tctx->last_run_at;
+			/*
+			 * Clamp: last_run_at is stamped from a possibly cached
+			 * rq clock, which can be ahead of the value read here
+			 * from timer context.
+			 */
+			u64 slice = time_delta(scx_bpf_now(), tctx->last_run_at);
 
 			if (slice > slice_max)
-				p->scx.slice = 0;
+				scx_bpf_task_set_slice(p, 0);
 		}
 		bpf_task_release(p);
 	}
