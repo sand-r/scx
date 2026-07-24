@@ -83,10 +83,29 @@ const volatile bool tickless_sched;
 const volatile u64 watchdog_kick_ns;
 
 /*
+ * Enable cpufreq control.
+ *
+ * Cleared when the platform owns frequency selection (e.g. intel_pstate=active
+ * with HWP), where scx_bpf_cpuperf_set() has no effect. In that case skip the
+ * per-switch CPU load tracking entirely, instead of computing a performance
+ * level that nothing consumes.
+ */
+const volatile bool cpufreq_control = true;
+
+/*
  * The CPU frequency performance level: a negative value will not affect the
  * performance level and will be ignored.
  */
 volatile s64 cpufreq_perf_lvl;
+
+/*
+ * Return true if the scheduler is dynamically driving the CPU performance
+ * level, false if the level is fixed or owned by the platform.
+ */
+static inline bool cpufreq_dynamic(void)
+{
+	return cpufreq_control && cpufreq_perf_lvl < 0;
+}
 
 /*
  * Scheduling statistics.
@@ -843,7 +862,7 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	 *  - if it's below the low threshold, scale down to half capacity;
 	 *  - otherwise, maintain the smoothed perf level.
 	 */
-	if (cpufreq_perf_lvl < 0) {
+	if (cpufreq_dynamic()) {
 		if (cctx->perf_lvl >= CPUFREQ_HIGH_THRESH)
 			perf_lvl = SCX_CPUPERF_ONE;
 		else if (cctx->perf_lvl <= CPUFREQ_LOW_THRESH)
@@ -871,7 +890,7 @@ void BPF_STRUCT_OPS(lnl_running, struct task_struct *p)
 	/*
 	 * Adjust target CPU frequency before the task starts to run.
 	 */
-	if (cpufreq_perf_lvl < 0)
+	if (cpufreq_dynamic())
 		update_cpu_load(p, tctx);
 
 	/*
@@ -918,7 +937,7 @@ void BPF_STRUCT_OPS(lnl_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * Update CPU runtime.
 	 */
-	if (cpufreq_perf_lvl < 0) {
+	if (cpufreq_dynamic()) {
 		struct cpu_ctx *cctx;
 
 		cctx = try_lookup_cpu_ctx(cpu);
@@ -1133,6 +1152,13 @@ static void init_cpuperf_target(void)
 	const struct cpumask *online_cpumask;
 	u64 perf_lvl;
 	s32 cpu;
+
+	/*
+	 * Leave the performance level alone if the platform owns frequency
+	 * selection.
+	 */
+	if (!cpufreq_control)
+		return;
 
 	online_cpumask = scx_bpf_get_online_cpumask();
 	bpf_for (cpu, 0, nr_cpu_ids) {

@@ -355,6 +355,11 @@ impl<'a> Scheduler<'a> {
         rodata.throttle_ns = opts.throttle_us * 1000;
         rodata.watchdog_kick_ns = opts.watchdog_kick_ms * 1_000_000;
         rodata.primary_all = domain.weight() == *NR_CPU_IDS;
+        // With intel_pstate=active, HWP owns frequency selection and
+        // scx_bpf_cpuperf_set() has no effect: disable cpufreq control so the
+        // BPF side skips the per-switch CPU load tracking entirely. This is
+        // rodata, so the dead branches are eliminated at load time.
+        rodata.cpufreq_control = !Self::intel_pstate_active();
 
         // Set scheduler flags.
         skel.struct_ops.lnl_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
@@ -482,6 +487,15 @@ impl<'a> Scheduler<'a> {
     }
 
     // Update hint for the cpufreq governor.
+    /// Return true if intel_pstate is running in active mode, where HWP owns
+    /// frequency selection and scx_bpf_cpuperf_set() has no effect.
+    fn intel_pstate_active() -> bool {
+        std::fs::read_to_string("/sys/devices/system/cpu/intel_pstate/status")
+            .ok()
+            .map(|s| s.trim() == "active")
+            .unwrap_or(false)
+    }
+
     fn init_cpufreq_perf(
         skel: &mut BpfSkel<'_>,
         primary_domain: &String,
@@ -489,11 +503,10 @@ impl<'a> Scheduler<'a> {
     ) -> Result<()> {
         // With intel_pstate=active, HWP owns frequency selection; scx_bpf_cpuperf_set
         // has no effect. Skip driving it and report it as disabled.
-        let intel_pstate_active =
-            std::fs::read_to_string("/sys/devices/system/cpu/intel_pstate/status")
-                .ok()
-                .map(|s| s.trim() == "active")
-                .unwrap_or(false);
+        //
+        // NOTE: the BPF side is gated by the `cpufreq_control` rodata flag set
+        // before load; the level below is only meaningful when it is enabled.
+        let intel_pstate_active = Self::intel_pstate_active();
 
         let perf_lvl: i64 = if intel_pstate_active {
             -1
