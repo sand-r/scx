@@ -587,6 +587,31 @@ static bool is_primary_cpu(const struct task_struct *p, s32 cpu)
 }
 
 /*
+ * Return true if any CPU in the primary domain is currently idle, i.e. if a
+ * task running outside the domain has somewhere better to go.
+ *
+ * This only tests the domain as a whole, not whether one of the idle CPUs is
+ * usable by a particular task: getting that exact would require intersecting
+ * three masks, and being occasionally optimistic here merely falls back to the
+ * unconditional behavior.
+ */
+static bool primary_cpu_idle(s32 cpu)
+{
+	const struct cpumask *primary = cast_mask(primary_cpumask);
+	const struct cpumask *idle_mask;
+	bool avail;
+
+	if (primary_all || !primary)
+		return false;
+
+	idle_mask = get_idle_cpumask(cpu);
+	avail = bpf_cpumask_intersects(idle_mask, primary);
+	scx_bpf_put_cpumask(idle_mask);
+
+	return avail;
+}
+
+/*
  * Attempt to dispatch a task directly to its assigned CPU.
  *
  * Return true if the task is dispatched, false otherwise.
@@ -732,9 +757,15 @@ static bool keep_running(const struct task_struct *p, s32 cpu)
 
 	/*
 	 * Do not keep running if the CPU is not in the primary domain and
-	 * the task can use the primary domain.
+	 * the task can use the primary domain, but only when the domain has
+	 * an idle CPU to move to.
+	 *
+	 * Giving up the CPU unconditionally means a task that overflowed to a
+	 * secondary CPU is re-enqueued on every slice expiry even while the
+	 * primary domain stays saturated, which is exactly the busy case, and
+	 * on a hybrid laptop the two domains share no cache level.
 	 */
-	if (!is_primary_cpu(p, cpu))
+	if (!is_primary_cpu(p, cpu) && primary_cpu_idle(cpu))
 		return false;
 
 	/*
