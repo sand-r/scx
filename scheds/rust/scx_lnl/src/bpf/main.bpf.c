@@ -968,8 +968,14 @@ void BPF_STRUCT_OPS(lnl_runnable, struct task_struct *p, u64 enq_flags)
 	 * Update the task's wakeup frequency based on the time since
 	 * the last wakeup, then cap the result at 1024 to avoid large
 	 * spikes.
+	 *
+	 * Consecutive wakeups can be observed from different CPUs, so the two
+	 * scx_bpf_now() readings may come from different rq clocks and the
+	 * interval can go backwards. Clamp it, and keep it non-zero:
+	 * update_freq() divides by it, and a zero divisor would silently
+	 * evaluate to zero and decay the wakeup frequency.
 	 */
-	delta_t = now - tctx->last_woke_at;
+	delta_t = time_delta(now, tctx->last_woke_at) ? : 1;
 	tctx->wakeup_freq = update_freq(tctx->wakeup_freq, delta_t);
 	tctx->wakeup_freq = MIN(tctx->wakeup_freq, MAX_WAKEUP_FREQ);
 	tctx->last_woke_at = now;
