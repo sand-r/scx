@@ -151,6 +151,15 @@ struct Opts {
     #[clap(long, default_value = "2000")]
     watchdog_kick_ms: u64,
 
+    /// Require this many tasks to be waiting for the primary domain before waking a CPU outside
+    /// it (0 = overflow as soon as the primary domain is busy).
+    ///
+    /// On a hybrid laptop the primary domain is the E-cores, so overflowing wakes a P-core and
+    /// the cache it fronts. Holding brief bursts on the primary domain avoids that, at the cost
+    /// of waiting up to one time slice for a primary CPU to free up.
+    #[clap(long, default_value = "0")]
+    spill_thresh: u64,
+
     /// Set CPU idle QoS resume latency in microseconds (-1 = disabled).
     ///
     /// Setting a lower latency value makes CPUs less likely to enter deeper idle states, enhancing
@@ -355,6 +364,7 @@ impl<'a> Scheduler<'a> {
         rodata.throttle_ns = opts.throttle_us * 1000;
         rodata.watchdog_kick_ns = opts.watchdog_kick_ms * 1_000_000;
         rodata.primary_all = domain.weight() == *NR_CPU_IDS;
+        rodata.spill_thresh = opts.spill_thresh;
         // With intel_pstate=active, HWP owns frequency selection and
         // scx_bpf_cpuperf_set() has no effect: disable cpufreq control so the
         // BPF side skips the per-switch CPU load tracking entirely. This is

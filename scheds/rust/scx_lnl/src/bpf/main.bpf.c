@@ -76,6 +76,18 @@ const volatile bool slice_lag_scaling;
 const volatile bool tickless_sched;
 
 /*
+ * Number of tasks that must already be waiting in the primary domain before
+ * an idle CPU outside it is woken up on a wakeup (0 = spill immediately).
+ *
+ * Overflowing to a secondary CPU as soon as the primary domain is busy wakes
+ * a core in the other cluster even for a task that only runs briefly, and on
+ * a hybrid laptop that means powering up the cluster and its cache for very
+ * little work. Requiring a backlog first keeps transient bursts on the
+ * primary domain, at the cost of waiting up to a slice for a CPU there.
+ */
+const volatile u64 spill_thresh;
+
+/*
  * Kick an idle CPU periodically to keep the sched_ext watchdog happy
  * (0 = disable). Some kernels may falsely treat long idle periods as a
  * runnable stall and automatically disable the scheduler.
@@ -478,6 +490,21 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	cpu = (primary_all || !primary) ? -ENOENT :
 			scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, primary, 0);
 	if (cpu < 0) {
+		/*
+		 * The primary domain is busy. Unless enough tasks are already
+		 * waiting for it, leave @p queued rather than waking a CPU
+		 * outside the domain: the primary CPUs are running and will
+		 * pick it up within a slice, whereas overflowing here powers
+		 * up an idle CPU in the other cluster.
+		 *
+		 * Tasks that cannot use the primary domain at all are not
+		 * subject to this and overflow immediately.
+		 */
+		if (spill_thresh && !primary_all && primary &&
+		    bpf_cpumask_intersects(primary, p->cpus_ptr) &&
+		    scx_bpf_dsq_nr_queued(__COMPAT_scx_bpf_cpu_node(prev_cpu)) < spill_thresh)
+			return prev_cpu;
+
 		cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
 		if (cpu < 0)
 			return prev_cpu;
