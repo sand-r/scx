@@ -76,16 +76,28 @@ const volatile bool slice_lag_scaling;
 const volatile bool tickless_sched;
 
 /*
- * Number of tasks that must already be waiting in the primary domain before
- * an idle CPU outside it is woken up on a wakeup (0 = spill immediately).
+ * Placement tunables.
  *
- * Overflowing to a secondary CPU as soon as the primary domain is busy wakes
- * a core in the other cluster even for a task that only runs briefly, and on
- * a hybrid laptop that means powering up the cluster and its cache for very
- * little work. Requiring a backlog first keeps transient bursts on the
- * primary domain, at the cost of waiting up to a slice for a CPU there.
+ * These live in .bss rather than .rodata so that user space can flip them on
+ * a running scheduler, which makes it possible to A/B a policy change without
+ * reloading and while the workload stays put. The cost is that the verifier
+ * cannot fold the branches away, but it pays the same cost in either setting,
+ * so a comparison is not skewed by one of them being cheaper to evaluate.
+ *
+ * @spill_thresh: number of tasks that must already be waiting in the primary
+ * domain before an idle CPU outside it is woken up (0 = spill immediately).
+ * Overflowing as soon as the primary domain is busy wakes a core in the other
+ * cluster even for a task that only runs briefly, and on a hybrid laptop that
+ * means powering up the cluster and its cache for very little work. Requiring
+ * a backlog first keeps transient bursts on the primary domain, at the cost of
+ * waiting up to a slice for a CPU there.
+ *
+ * @strict_primary: restore the original behavior of leaving a secondary CPU
+ * whenever the task could use the primary domain, whether or not the domain
+ * has an idle CPU to take it.
  */
-const volatile u64 spill_thresh;
+volatile u64 spill_thresh;
+volatile bool strict_primary;
 
 /*
  * Kick an idle CPU periodically to keep the sched_ext watchdog happy
@@ -792,7 +804,8 @@ static bool keep_running(const struct task_struct *p, s32 cpu)
 	 * primary domain stays saturated, which is exactly the busy case, and
 	 * on a hybrid laptop the two domains share no cache level.
 	 */
-	if (!is_primary_cpu(p, cpu) && primary_cpu_idle(cpu))
+	if (!is_primary_cpu(p, cpu) &&
+	    (strict_primary || primary_cpu_idle(cpu)))
 		return false;
 
 	/*

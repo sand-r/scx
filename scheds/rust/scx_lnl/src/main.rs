@@ -160,6 +160,22 @@ struct Opts {
     #[clap(long, default_value = "0")]
     spill_thresh: u64,
 
+    /// Leave a CPU outside the primary domain whenever the task could use the domain, even if
+    /// the domain has no idle CPU to take it.
+    ///
+    /// This restores the original behavior and exists to A/B the current one.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    strict_primary: bool,
+
+    /// Re-read the placement tunables from this file once a second, so they can be changed on a
+    /// running scheduler.
+    ///
+    /// One `key=value` per line; `#` starts a comment. Recognised keys are `spill_thresh` and
+    /// `strict_primary`. Keys that are absent keep their current value, and a file that cannot
+    /// be read is ignored, so writing it atomically is not required.
+    #[clap(long)]
+    tunables: Option<String>,
+
     /// Set CPU idle QoS resume latency in microseconds (-1 = disabled).
     ///
     /// Setting a lower latency value makes CPUs less likely to enter deeper idle states, enhancing
@@ -364,7 +380,6 @@ impl<'a> Scheduler<'a> {
         rodata.throttle_ns = opts.throttle_us * 1000;
         rodata.watchdog_kick_ns = opts.watchdog_kick_ms * 1_000_000;
         rodata.primary_all = domain.weight() == *NR_CPU_IDS;
-        rodata.spill_thresh = opts.spill_thresh;
         // With intel_pstate=active, HWP owns frequency selection and
         // scx_bpf_cpuperf_set() has no effect: disable cpufreq control so the
         // BPF side skips the per-switch CPU load tracking entirely. This is
@@ -404,6 +419,20 @@ impl<'a> Scheduler<'a> {
                 err
             );
         }
+
+        // Placement tunables live in .bss so they can also be changed at runtime.
+        let bss = skel.maps.bss_data.as_mut().unwrap();
+        bss.spill_thresh = opts.spill_thresh;
+        bss.strict_primary = opts.strict_primary;
+        info!(
+            "placement: spill_thresh={} strict_primary={}{}",
+            opts.spill_thresh,
+            opts.strict_primary,
+            match &opts.tunables {
+                Some(p) => format!(" (tracking {})", p),
+                None => String::new(),
+            }
+        );
 
         // Initialize SMT domains.
         if smt_enabled {
@@ -645,6 +674,57 @@ impl<'a> Scheduler<'a> {
         uei_exited!(&self.skel, uei)
     }
 
+    /// Re-read the placement tunables, if the user asked for a file to track.
+    ///
+    /// Anything unparseable is skipped rather than treated as an error: this is
+    /// polled once a second against a file the user edits by hand, so a partial
+    /// write should be ignored and picked up on the next pass.
+    fn refresh_tunables(&mut self) {
+        let Some(path) = self.opts.tunables.as_deref() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+
+        let (mut spill, mut strict) = {
+            let bss = self.skel.maps.bss_data.as_ref().unwrap();
+            (bss.spill_thresh, bss.strict_primary)
+        };
+        let (prev_spill, prev_strict) = (spill, strict);
+
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let val = val.trim();
+            match key.trim() {
+                "spill_thresh" => {
+                    if let Ok(v) = val.parse() {
+                        spill = v;
+                    }
+                }
+                "strict_primary" => match val {
+                    "1" | "true" | "yes" | "on" => strict = true,
+                    "0" | "false" | "no" | "off" => strict = false,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        if (spill, strict) != (prev_spill, prev_strict) {
+            let bss = self.skel.maps.bss_data.as_mut().unwrap();
+            bss.spill_thresh = spill;
+            bss.strict_primary = strict;
+            info!(
+                "placement tunables updated: spill_thresh={} strict_primary={}",
+                spill, strict
+            );
+        }
+    }
+
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
@@ -653,6 +733,7 @@ impl<'a> Scheduler<'a> {
                 self.user_restart = true;
                 break;
             }
+            self.refresh_tunables();
 
             match req_ch.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
