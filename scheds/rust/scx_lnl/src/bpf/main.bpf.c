@@ -836,9 +836,12 @@ void BPF_STRUCT_OPS(lnl_dispatch, s32 cpu, struct task_struct *prev)
 
 		if (tctx) {
 			/*
-			 * scx_bpf_now() may return a cached rq clock, which can
-			 * be older than the timestamp recorded in ops.running():
-			 * clamp to avoid wrapping the unsigned subtraction.
+			 * @prev has been running here since ops.running()
+			 * stamped last_run_at, so both readings come from this
+			 * CPU and scx_bpf_now() cannot go backwards between
+			 * them. They can still be equal, within one period of
+			 * the cached rq clock, which time_delta() reports as a
+			 * zero-length slice.
 			 */
 			u64 slice = time_delta(scx_bpf_now(), tctx->last_run_at);
 			u64 prev_vtime = prev->scx.dsq_vtime +
@@ -1025,7 +1028,14 @@ void BPF_STRUCT_OPS(lnl_stopping, struct task_struct *p, bool runnable)
 
 void BPF_STRUCT_OPS(lnl_runnable, struct task_struct *p, u64 enq_flags)
 {
-	u64 now = scx_bpf_now(), delta_t;
+	/*
+	 * Consecutive wakeups of a task are observed from whichever CPU wakes
+	 * it, so the two ends of the interval below can be read on different
+	 * CPUs. scx_bpf_now() is only guaranteed not to go backwards within a
+	 * single CPU, so it cannot be used here: use the global clock, which
+	 * is monotonic everywhere.
+	 */
+	u64 now = bpf_ktime_get_ns(), delta_t;
 	struct task_ctx *tctx;
 
 	if (rr_sched)
@@ -1040,15 +1050,18 @@ void BPF_STRUCT_OPS(lnl_runnable, struct task_struct *p, u64 enq_flags)
 	 * the last wakeup, then cap the result at 1024 to avoid large
 	 * spikes.
 	 *
-	 * Consecutive wakeups can be observed from different CPUs, so the two
-	 * scx_bpf_now() readings may come from different rq clocks and the
-	 * interval can go backwards. Clamp it, and keep it non-zero:
-	 * update_freq() divides by it, and a zero divisor would silently
-	 * evaluate to zero and decay the wakeup frequency.
+	 * Skip the update rather than substitute a value if the interval is
+	 * not usable: update_freq() divides by it, so a zero would evaluate
+	 * to zero and decay the frequency, while a small stand-in would peg
+	 * it at the maximum and hand the task the largest sleep credit
+	 * task_dl() can grant. Leaving the previous estimate alone is the
+	 * only option here that does not invent a measurement.
 	 */
-	delta_t = time_delta(now, tctx->last_woke_at) ? : 1;
-	tctx->wakeup_freq = update_freq(tctx->wakeup_freq, delta_t);
-	tctx->wakeup_freq = MIN(tctx->wakeup_freq, MAX_WAKEUP_FREQ);
+	delta_t = time_delta(now, tctx->last_woke_at);
+	if (delta_t) {
+		tctx->wakeup_freq = update_freq(tctx->wakeup_freq, delta_t);
+		tctx->wakeup_freq = MIN(tctx->wakeup_freq, MAX_WAKEUP_FREQ);
+	}
 	tctx->last_woke_at = now;
 }
 
@@ -1337,11 +1350,14 @@ static int tickless_timerfn(void *map, int *key, struct bpf_timer *timer)
 		tctx = try_lookup_task_ctx(p);
 		if (tctx) {
 			/*
-			 * Clamp: last_run_at is stamped from a possibly cached
-			 * rq clock, which can be ahead of the value read here
-			 * from timer context.
+			 * last_run_at was stamped on the CPU running @p, which
+			 * is not the CPU this timer fires on, so compare global
+			 * clock values: scx_bpf_now() may go backwards across
+			 * CPUs. The timer is cold enough that the cheaper clock
+			 * is not worth the ambiguity.
 			 */
-			u64 slice = time_delta(scx_bpf_now(), tctx->last_run_at);
+			u64 slice = time_delta(bpf_ktime_get_ns(),
+					       tctx->last_run_at);
 
 			if (slice > slice_max)
 				scx_bpf_task_set_slice(p, 0);
