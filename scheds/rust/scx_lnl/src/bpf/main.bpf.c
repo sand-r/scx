@@ -293,8 +293,22 @@ struct task_ctx {
 	/*
 	 * Timestamp when the task started to run on a CPU (used to
 	 * evaluate the consumed time slice).
+	 *
+	 * Taken with scx_bpf_now(), so it is only comparable against another
+	 * scx_bpf_now() read on the same CPU.
 	 */
 	u64 last_run_at;
+
+	/*
+	 * The same instant on the global clock, for the tickless timer.
+	 *
+	 * The timer runs on one CPU and inspects tasks running on the others,
+	 * which rules out scx_bpf_now(): it may go backwards between CPUs, and
+	 * its readings are in the scheduler's clock domain rather than the
+	 * monotonic one, so the two cannot be subtracted from each other.
+	 * Only maintained when tickless mode is enabled.
+	 */
+	u64 last_run_at_mono;
 
 	/*
 	 * Task wakeup frequency.
@@ -976,6 +990,13 @@ void BPF_STRUCT_OPS(lnl_running, struct task_struct *p)
 	tctx->last_run_at = scx_bpf_now();
 
 	/*
+	 * tickless_sched is read-only after load, so this costs nothing when
+	 * tickless mode is off: the verifier drops the branch.
+	 */
+	if (tickless_sched)
+		tctx->last_run_at_mono = bpf_ktime_get_ns();
+
+	/*
 	 * Adjust target CPU frequency before the task starts to run.
 	 */
 	if (cpufreq_dynamic())
@@ -1056,8 +1077,8 @@ void BPF_STRUCT_OPS(lnl_runnable, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Update the task's wakeup frequency based on the time since
-	 * the last wakeup, then cap the result at 1024 to avoid large
-	 * spikes.
+	 * the last wakeup, then cap the result at MAX_WAKEUP_FREQ to avoid
+	 * large spikes.
 	 *
 	 * Skip the update rather than substitute a value if the interval is
 	 * not usable: update_freq() divides by it, so a zero would evaluate
@@ -1359,14 +1380,13 @@ static int tickless_timerfn(void *map, int *key, struct bpf_timer *timer)
 		tctx = try_lookup_task_ctx(p);
 		if (tctx) {
 			/*
-			 * last_run_at was stamped on the CPU running @p, which
-			 * is not the CPU this timer fires on, so compare global
-			 * clock values: scx_bpf_now() may go backwards across
-			 * CPUs. The timer is cold enough that the cheaper clock
-			 * is not worth the ambiguity.
+			 * Both ends on the global clock: @p is running on
+			 * another CPU, so its scx_bpf_now() timestamp is
+			 * neither ordered against this one nor in the same
+			 * clock domain.
 			 */
 			u64 slice = time_delta(bpf_ktime_get_ns(),
-					       tctx->last_run_at);
+					       tctx->last_run_at_mono);
 
 			if (slice > slice_max)
 				scx_bpf_task_set_slice(p, 0);
