@@ -151,12 +151,16 @@ struct Opts {
     #[clap(long, default_value = "2000")]
     watchdog_kick_ms: u64,
 
-    /// Require this many tasks to be waiting for the primary domain before waking a CPU outside
-    /// it (0 = overflow as soon as the primary domain is busy).
+    /// Require the node's shared queue to be this deep before waking a CPU outside the primary
+    /// domain (0 = overflow as soon as the primary domain is busy).
     ///
     /// On a hybrid laptop the primary domain is the E-cores, so overflowing wakes a P-core and
     /// the cache it fronts. Holding brief bursts on the primary domain avoids that, at the cost
     /// of waiting up to one time slice for a primary CPU to free up.
+    ///
+    /// The queue is shared by every CPU on the node, so this gauges how backed up the node is
+    /// rather than counting tasks waiting specifically for the primary domain. Ignored on
+    /// systems with more than one NUMA node.
     #[clap(long, default_value = "0")]
     spill_thresh: u64,
 
